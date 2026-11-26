@@ -1,0 +1,6 @@
+{
+  "name": "Polymorphe",
+  "description": "Workbench d'audit smart contract pour chasseurs de bounty : intake, verdict G0 déterministe, threat model éditable, chasse autonome guidée, PoC rejoué et fix-review.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
