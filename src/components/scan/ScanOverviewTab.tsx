@@ -52,7 +52,7 @@ export function ScanOverviewTab({ scan, locale }: ScanOverviewTabProps) {
               {t.scan.verdictTableTitle}
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Évaluation déterministe en code pur (L7) — chaque ligne cite son artefact vérifiable.
+              Évaluation déterministe en code pur — chaque ligne cite son artefact : attestation opérateur (avec source) ou lecture RPC exécutée.
             </p>
           </div>
           {scan.g0.overrideReason && (
@@ -225,18 +225,61 @@ export function ScanOverviewTab({ scan, locale }: ScanOverviewTabProps) {
               {t.scan.ingestSummaryTitle}
             </h3>
             <span className="font-mono text-xs text-slate-500 dark:text-slate-400">
-              {scan.ingest.contractsCount} contrats · FFI off
+              {scan.ingest.contractsCount} contrats · FFI off · {scan.ingest.sandbox === 'bwrap' ? 'sandbox bwrap' : 'SANS sandbox'}
             </span>
           </div>
+
+          {scan.workspace && (
+            <div className="text-xs font-mono text-slate-600 dark:text-slate-400 break-all">
+              {scan.workspace.repoUrl} @ {scan.workspace.commit}
+              {scan.workspace.projectDir ? ` · projet ${scan.workspace.projectDir}/` : ''}
+              {scan.workspace.sanitizedConfig.length > 0 && (
+                <div className="mt-1 text-amber-700 dark:text-amber-400">
+                  Config neutralisée : {scan.workspace.sanitizedConfig.join(' ; ')}
+                </div>
+              )}
+            </div>
+          )}
 
           <p className="text-xs text-slate-600 dark:text-slate-400">
             {scan.ingest.negativeSpaceSummary}
           </p>
 
+          {scan.ingest.provenance && scan.ingest.provenance.length > 0 && (
+            <div className="space-y-1.5">
+              <div className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                Provenance bytecode ↔ dépôt (bloc {scan.ingest.provenance[0].blockNumber})
+              </div>
+              <ul className="text-xs font-mono space-y-1">
+                {scan.ingest.provenance.map((p) => (
+                  <li key={p.address} className="break-all">
+                    <span
+                      className={
+                        p.status === 'matched'
+                          ? 'text-emerald-700 dark:text-emerald-400'
+                          : 'text-amber-700 dark:text-amber-400'
+                      }
+                    >
+                      {p.status}
+                    </span>{' '}
+                    {p.address}
+                    {p.comparedAddress !== p.address ? ` → impl ${p.comparedAddress}` : ''}
+                    {p.bestMatch
+                      ? ` · ${p.bestMatch.contract} ${p.bestMatch.matchedSelectors}/${p.bestMatch.abiSelectors}`
+                      : ''}
+                    {p.bestMatch && p.bestMatch.missingSelectors.length > 0 && (
+                      <div className="text-slate-500">absents du déployé : {p.bestMatch.missingSelectors.join(', ')}</div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           {scan.ingest.untestedMonetaryFunctions.length > 0 && (
             <div className="space-y-2">
               <div className="text-xs font-semibold text-slate-800 dark:text-slate-200">
-                Fonctions monétaires non testées (Door A)
+                Fonctions mutatrices jamais nommées par les tests (Door A)
               </div>
               <ul className="divide-y divide-slate-100 dark:divide-slate-800/80 text-xs">
                 {scan.ingest.untestedMonetaryFunctions.map((fn) => (

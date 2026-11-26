@@ -17,7 +17,7 @@ export const translations = {
       subtitle:
         'Collez l’URL d’un programme Immunefi ou Cantina, un dépôt GitHub ou un chemin local. Chaque gate s’exécute automatiquement avec ses artefacts vérifiables.',
       inputLabel: 'Cible (URL programme Immunefi/Cantina, dépôt GitHub ou chemin local)',
-      inputPlaceholder: 'https://immunefi.com/bug-bounty/... ou ./fixtures/vuln-vault-seam',
+      inputPlaceholder: 'https://immunefi.com/bug-bounty/…, https://github.com/org/repo ou /chemin/absolu',
       launch: 'Scanner',
       launching: 'Lancement…',
       optionsToggle: 'Options avancées',
@@ -141,7 +141,7 @@ export const translations = {
       subtitle:
         'Paste an Immunefi or Cantina program URL, a GitHub repository, or a local path. Every gate runs automatically with verifiable artifacts.',
       inputLabel: 'Target (Immunefi/Cantina program URL, GitHub repo, or local path)',
-      inputPlaceholder: 'https://immunefi.com/bug-bounty/... or ./fixtures/vuln-vault-seam',
+      inputPlaceholder: 'https://immunefi.com/bug-bounty/…, https://github.com/org/repo or /absolute/path',
       launch: 'Scan',
       launching: 'Starting…',
       optionsToggle: 'Advanced options',

@@ -13,25 +13,6 @@ interface HomeViewProps {
   onOpenScan: (scanId: string) => void;
 }
 
-const DEMO_TARGETS = [
-  {
-    label: 'Programme actif (Immunefi)',
-    url: 'https://immunefi.com/bug-bounty/meridian-lending/',
-  },
-  {
-    label: 'Programme Arbitrum (RPC manquant)',
-    url: 'https://cantina.xyz/bounties/vertex-arb-vault',
-  },
-  {
-    label: 'Programme en pause (NO-GO)',
-    url: 'https://immunefi.com/bug-bounty/paused-legacy-pool/',
-  },
-  {
-    label: 'Mode labo local (fixture)',
-    url: './fixtures/vuln-vault-seam',
-  },
-];
-
 export function HomeView({ scans, loading, locale, onScanCreated, onOpenScan }: HomeViewProps) {
   const t = getT(locale);
   const [targetUrl, setTargetUrl] = useState('');
@@ -123,27 +104,11 @@ export function HomeView({ scans, loading, locale, onScanCreated, onOpenScan }: 
             </p>
           )}
 
-          {/* Quick demo presets (clean text links, zero pills) */}
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-slate-500 dark:text-slate-400">
-            <span className="font-medium text-slate-600 dark:text-slate-300">
-              {t.home.presetsLabel} :
-            </span>
-            {DEMO_TARGETS.map((preset, idx) => (
-              <React.Fragment key={preset.url}>
-                {idx > 0 && <span aria-hidden="true">·</span>}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setTargetUrl(preset.url);
-                    setError(null);
-                  }}
-                  className="text-blue-700 dark:text-blue-400 hover:underline underline-offset-4 text-left"
-                >
-                  {preset.label}
-                </button>
-              </React.Fragment>
-            ))}
-          </div>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Programme : rien n’est déduit de l’URL — statut, impacts verbatim, adresses et dépôt sont attestés ensuite depuis la page du programme.
+            Dépôt : <span className="font-mono">https://github.com/org/repo</span> (ou <span className="font-mono">/tree/&lt;sha&gt;</span> pour épingler un commit).
+            Local : chemin absolu.
+          </p>
 
           {/* Collapsible Options */}
           <div className="pt-2 border-t border-slate-100 dark:border-slate-800/80">

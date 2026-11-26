@@ -1,581 +1,282 @@
 import 'dotenv/config';
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import {
-  GEMINI_MODEL,
-  generateHypothesesWithGemini,
-  generateThreatModelWithGemini,
-  isGeminiConfigured,
-  runDisconfirmerWithGemini,
-} from './src/server/gemini';
 import {
   canCloseScanWithoutFindings,
   canExportFinding,
   canHunt,
   classifyHypothesisClosure,
-  evaluateG0,
   generateBountyReport,
   mergeThreatModel,
   validateG0Override,
   validateOperatorSignoff,
 } from './src/core/doctrine';
-import {
-  createInitialAdvancedSnapshot,
-  createInitialChainSettings,
-  createInitialDoctorChecks,
-  createInitialLlmSettings,
-  createInitialScans,
-} from './src/data/fixtures';
+import { Auth, PASSWORD_MAX, PASSWORD_MIN, requestUser } from './src/server/auth';
+import { buildScanRecord, classifyTarget, Engine, newId } from './src/server/engine';
+import { probeSandbox, toolVersion } from './src/server/exec';
+import { isGeminiConfigured, verifyFileLine } from './src/server/gemini';
+import { validatePocSource } from './src/server/replay';
+import { ADDRESS_RE } from './src/server/rpc';
+import { Store } from './src/server/store';
+import { extractFunction, SHA_RE, validateRepoUrl, WorkspaceError } from './src/server/workspace';
 import type {
+  AdvancedSnapshot,
   ChainSetting,
+  DoctorCheck,
   ExportFormat,
   Finding,
-  FixReviewRecord,
-  LlmSettings,
+  FindingSeverity,
+  ProgramScope,
   ScanRun,
-  ScopeKind,
-  TargetKind,
 } from './src/types';
+import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const { scans: initialScans, findings: initialFindings } = createInitialScans();
-
-const state = {
-  scans: initialScans as ScanRun[],
-  findings: initialFindings as Finding[],
-  chains: createInitialChainSettings() as ChainSetting[],
-  llm: createInitialLlmSettings() as LlmSettings,
-  doctor: createInitialDoctorChecks(),
-  setupCompleted: true,
-  authenticatedUser: 'admin',
-  logs: createInitialAdvancedSnapshot(initialScans).serverLogs,
-};
+const DATA_DIR = process.env.POLYMORPHE_DATA_DIR || path.join(__dirname, '.polymorphe-data');
+const store = new Store(DATA_DIR);
+const auth = new Auth(store);
 
 // SSE subscribers keyed by scanId
 const sseClients = new Map<string, Set<express.Response>>();
-
 function pushScanEvent(scanId: string, eventType: string, payload: unknown) {
   const clients = sseClients.get(scanId);
   if (!clients || clients.size === 0) return;
   const serialized = `event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`;
-  for (const res of clients) {
-    res.write(serialized);
+  for (const res of clients) res.write(serialized);
+}
+
+const engine = new Engine(store, pushScanEvent);
+
+// Runs interrupted by a restart did not finish: say so instead of leaving them "running".
+for (const run of store.state.runs) {
+  if (run.status === 'running' || run.status === 'queued') {
+    run.status = 'error';
+    run.error = 'Interrompu par un redémarrage du serveur.';
+    run.passed = false;
+  }
+}
+for (const f of store.state.findings) {
+  if (f.status === 'replaying') f.status = 'replay_failed';
+  for (const fr of f.fixReviews) if (fr.status === 'running') {
+    fr.status = 'error';
+    fr.verdict = 'inconclusive';
+    fr.error = 'Interrompu par un redémarrage du serveur.';
+  }
+}
+for (const s of store.state.scans) {
+  for (const step of s.steps) if (step.status === 'running') {
+    step.status = 'failed';
+    step.detail = 'Interrompu par un redémarrage du serveur.';
+  }
+  engine.recomputeStatus(s);
+}
+store.commit();
+
+// ------------------------------------------------------------------ helpers
+
+class HttpError extends Error {
+  constructor(public status: number, message: string, public code?: string) {
+    super(message);
   }
 }
 
-function appendServerLog(level: 'info' | 'warn', component: string, msg: string) {
-  const ts = new Date().toISOString().slice(11, 19);
-  state.logs.unshift({ ts, level, component, msg });
-  if (state.logs.length > 80) state.logs.pop();
-}
-
-function classifyTarget(rawUrl: string): {
-  targetKind: TargetKind;
-  scopeKind: ScopeKind;
-  programName: string;
-  chain: string;
-  programActive: boolean;
-  programStatusText: string;
-  verbatimImpacts: string[];
-  maxBountyUsd: number | null;
-  fundsAtRiskUsd: number | null;
-  dwellDays: number;
-  knownIssuesCount: number;
-  tombstones: string[];
-} {
-  const trimmed = rawUrl.trim();
-  const lower = trimmed.toLowerCase();
-
-  if (lower.startsWith('./') || lower.startsWith('/') || lower.startsWith('~/')) {
-    const base = trimmed.split('/').filter(Boolean).pop() || 'local-target';
-    return {
-      targetKind: 'local',
-      scopeKind: 'commit_anchored',
-      programName: `${base} (Labo)`,
-      chain: 'ethereum',
-      programActive: false,
-      programStatusText: 'Chemin local',
-      verbatimImpacts: [],
-      maxBountyUsd: null,
-      fundsAtRiskUsd: null,
-      dwellDays: 0,
-      knownIssuesCount: 0,
-      tombstones: [],
-    };
-  }
-
-  if (lower.includes('github.com')) {
-    const parts = trimmed.replace(/\/+$/, '').split('/');
-    const repo = parts.slice(-2).join('/') || 'github-repo';
-    return {
-      targetKind: 'repo',
-      scopeKind: 'commit_anchored',
-      programName: `${repo} (Labo)`,
-      chain: 'ethereum',
-      programActive: false,
-      programStatusText: 'Dépôt GitHub (mode labo)',
-      verbatimImpacts: [],
-      maxBountyUsd: null,
-      fundsAtRiskUsd: null,
-      dwellDays: 12,
-      knownIssuesCount: 0,
-      tombstones: [],
-    };
-  }
-
-  // Program URL (Immunefi / Cantina)
-  const isPaused = lower.includes('paused') || lower.includes('closed') || lower.includes('strata');
-  const isArb = lower.includes('arb') || lower.includes('helios');
-  const isBase = lower.includes('base');
-  const isCommitContest = lower.includes('contest') || lower.includes('sherlock');
-  const slug =
-    trimmed
-      .replace(/\/+$/, '')
-      .split('/')
-      .pop()
-      ?.replace(/[-_]/g, ' ')
-      .replace(/\b\w/g, (c) => c.toUpperCase()) || 'Programme SC';
-
-  return {
-    targetKind: 'program',
-    scopeKind: isCommitContest ? 'commit_anchored' : 'deployed',
-    programName: slug,
-    chain: isArb ? 'arbitrum' : isBase ? 'base' : 'ethereum',
-    programActive: !isPaused,
-    programStatusText: isPaused ? 'Paused' : lower.includes('cantina') ? 'Active · Cantina' : 'Active · Immunefi',
-    verbatimImpacts: isPaused
-      ? []
-      : [
-          'Direct theft of any user funds, whether at-rest or in-motion',
-          'Permanent freezing of user principal',
-        ],
-    maxBountyUsd: isPaused ? 0 : 200_000,
-    fundsAtRiskUsd: isPaused ? 28_000 : 14_200_000,
-    dwellDays: isPaused ? 310 : 64,
-    knownIssuesCount: isPaused ? 7 : 2,
-    tombstones: isPaused ? ['Known fee-on-transfer exclusion'] : ['Rounding dust <= 1 wei on share conversion'],
+type Handler = (req: express.Request, res: express.Response) => unknown | Promise<unknown>;
+function h(fn: Handler) {
+  return async (req: express.Request, res: express.Response) => {
+    try {
+      await fn(req, res);
+    } catch (err) {
+      if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, code: err.code });
+      if (err instanceof WorkspaceError) return res.status(400).json({ error: err.message });
+      const msg = err instanceof Error ? err.message : 'Erreur interne.';
+      store.log('warn', 'http', `${req.method} ${req.path} : ${msg.slice(0, 300)}`);
+      return res.status(500).json({ error: msg });
+    }
   };
 }
 
-function seedHuntForScan(scan: ScanRun) {
-  const now = new Date().toISOString();
-  const isLab = scan.targetKind !== 'program';
-  scan.status = 'done';
-  scan.updatedAt = now;
-  scan.threatModel = {
-    provenance: 'pipeline_auto',
-    updatedAt: now,
-    summary: `Threat model généré automatiquement pour ${scan.programName} après validation G0 (${scan.g0.decision}).`,
-    verbatimImpacts: scan.threatModel.verbatimImpacts,
-    exclusions: isLab
-      ? ['Mode labo : export bounty désactivé (L9).']
-      : ['Compromission des clés privées utilisateur', 'Tokens hors liste blanche'],
-    tombstones: scan.threatModel.tombstones,
-    invariants: [
-      'Aucun appelant non autorisé ne peut extraire plus que son solde comptabilisé.',
-      'Les nonces et signatures EIP-712 sont à usage unique et liés au destinataire.',
-    ],
-    trustBoundaries: [
-      'Fonctions externes de dépôt / retrait : permissionless',
-      'Gouvernance multisig : hors périmètre sauf escalade de privilèges',
-    ],
-  };
+function getScan(id: string): ScanRun {
+  const scan = engine.scan(id);
+  if (!scan) throw new HttpError(404, 'Scan introuvable.');
+  return scan;
+}
 
-  const hyp1Id = `hyp-${scan.id}-1`;
-  const hyp2Id = `hyp-${scan.id}-2`;
-  const hyp3Id = `hyp-${scan.id}-3`;
-  const findingId = `FND-${scan.id.slice(-4).toUpperCase()}-01`;
+function getFinding(id: string): { finding: Finding; scan: ScanRun } {
+  const finding = store.state.findings.find((f) => f.id === id);
+  if (!finding) throw new HttpError(404, 'Finding introuvable.');
+  return { finding, scan: getScan(finding.scanId) };
+}
 
-  scan.hypotheses = [
-    {
-      id: hyp1Id,
-      scanId: scan.id,
-      door: 'door_a_untested',
-      title: 'Réentrance ou comptabilité obsolète sur le chemin de retrait asynchrone',
-      targetFileLine: 'src/VaultCore.sol:148',
-      outcome: 'candidate',
-      artifactId: `art-poc-${findingId}`,
-      reason: 'PoC Foundry exécuté + rejeu clean-room validé (FOUNDRY_FFI=false).',
-      updatedAt: now,
-    },
-    {
-      id: hyp2Id,
-      scanId: scan.id,
-      door: 'invariant',
-      title: 'Manipulation du ratio de parts via donation directe au contrat',
-      targetFileLine: 'src/VaultCore.sol:92',
-      outcome: 'killed_by_artifact',
-      artifactId: `art-forge-kill-${scan.id}-92`,
-      reason: 'Comptabilité interne par variable trackedAssets confirmée par test Foundry.',
-      updatedAt: now,
-    },
-    {
-      id: hyp3Id,
-      scanId: scan.id,
-      door: 'seam',
-      title: 'Détournement de paramètres relayer sur l’exécution de signature off-chain',
-      targetFileLine: 'src/RelayerAdapter.sol:61',
-      outcome: 'abandoned_unproven',
-      reason: 'Aucun artefact d’invalidation exécuté dans le budget initial.',
-      updatedAt: now,
-    },
-  ];
+function str(v: unknown, max = 4000): string {
+  return typeof v === 'string' ? v.trim().slice(0, max) : '';
+}
 
-  scan.budget.tokensUsed = 54_000;
-  scan.budget.elapsedSeconds = 218;
-  scan.budget.history = [
-    { tokensK: 0, hypothesesClosed: 0, findingsCount: 0 },
-    { tokensK: 24, hypothesesClosed: 1, findingsCount: 0 },
-    { tokensK: 54, hypothesesClosed: 3, findingsCount: 1 },
-  ];
-
-  scan.steps = scan.steps.map((s) => {
-    if (s.key === 'g0') {
-      return { ...s, status: 'done', detail: `Verdict ${scan.g0.decision.toUpperCase()}`, updatedAt: now };
-    }
-    if (s.key === 'threat_model') {
-      return { ...s, status: 'done', detail: 'Brouillon auto-pipeline prêt et éditable.', updatedAt: now };
-    }
-    if (s.key === 'hunt') {
-      return { ...s, status: 'done', detail: '3 hypothèses traitées (1 worker — LOCK #2).', updatedAt: now };
-    }
-    if (s.key === 'candidates') {
-      return { ...s, status: 'done', detail: '1 candidat vérifié en clean-room.', updatedAt: now };
-    }
-    return s;
-  });
-
-  scan.hunterLogs.push(
-    {
-      id: `log-${Date.now()}-1`,
-      timestamp: now.slice(11, 19),
-      role: 'planner',
-      message: `Verdict G0 = ${scan.g0.decision}. 3 hypothèses seedées avant chasse (R6).`,
-      tokensUsed: 9_200,
-    },
-    {
-      id: `log-${Date.now()}-2`,
-      timestamp: now.slice(11, 19),
-      role: 'worker',
-      message: `Candidat ${findingId} enregistré derrière LOCK #5 (PoC rejoué en clean-room).`,
-      tokensUsed: 46_000,
-    },
-    {
-      id: `log-${Date.now()}-3`,
-      timestamp: now.slice(11, 19),
-      role: 'disconfirmer',
-      message: `Contre-vérification automatique ${findingId} terminée (R13 : aucune alternative légitime).`,
-      tokensUsed: 54_000,
-    }
-  );
-
-  const existing = state.findings.find((f) => f.id === findingId);
-  if (!existing) {
-    state.findings.unshift({
-      id: findingId,
-      scanId: scan.id,
-      title: `Comptabilité obsolète sur le retrait asynchrone (${scan.programName})`,
-      severity: 'high',
-      status: 'candidate',
-      source: 'autonomous_hunter',
-      createdAt: now,
-      summary:
-        'Le calcul des parts brûlées lors du règlement asynchrone lit un taux de change antérieur à la mise à jour des pertes réalisées, permettant à un attaquant de retirer davantage que sa quote-part réelle.',
-      verbatimImpactLine: scan.threatModel.verbatimImpacts[0] ?? null,
-      affectedFileLine: 'src/VaultCore.sol:148-167',
-      affectedCode: `function settleWithdrawal(uint256 requestId) external {
-    Request storage r = requests[requestId];
-    require(!r.settled, "ALREADY_SETTLED");
-    uint256 payout = previewRedeem(r.shares); // uses stale cached exchangeRate
-    asset.safeTransfer(r.owner, payout);
-    r.settled = true;
-}`,
-      pocFile: `test/poc/${findingId.replace(/[^A-Za-z0-9]/g, '')}.t.sol`,
-      pocSource: `contract ${findingId.replace(/[^A-Za-z0-9]/g, '')} is Test {
-    function test_StaleRateExtraction() public {
-        uint256 beforeBal = asset.balanceOf(attacker);
-        vault.settleWithdrawal(1);
-        assertGt(asset.balanceOf(attacker) - beforeBal, deposited);
-    }
-}`,
-      pocReplayCommand: `FOUNDRY_FFI=false forge test --match-contract ${findingId.replace(/[^A-Za-z0-9]/g, '')} -vvvv`,
-      pocReplayTrace: `[PASS] test_StaleRateExtraction() (gas: 184210)
-  └─ Extracted surplus: 18.42 ETH above deposited principal
-Clean-room re-execution: PASS (2/2 runs deterministic)`,
-      cleanRoomVerified: true,
-      disconfirmer: {
-        status: 'clear',
-        ranAt: now,
-        legitimateAlternativeTest:
-          'Aucune séquence d’appels légitimes ne produit un retrait supérieur aux actifs nets attribuables.',
-        notes: 'Validé contre le périmètre et les tombstones connus.',
-        canKillFinding: false,
-      },
-      recommendation:
-        'Synchroniser le taux de change réalisé avant le calcul du payout et marquer r.settled = true avant asset.safeTransfer.',
-      fixReviews: [],
-    });
+function httpsUrl(v: unknown, what: string): string {
+  const s = str(v, 2000);
+  try {
+    const u = new URL(s);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error();
+    return u.toString();
+  } catch {
+    throw new HttpError(400, `${what} : URL http(s) valide requise.`);
   }
 }
+
+function lines(v: unknown, maxItems = 300): string[] {
+  const arr = Array.isArray(v) ? v : typeof v === 'string' ? v.split('\n') : [];
+  return arr
+    .map((x) => (typeof x === 'string' ? x.trim() : ''))
+    .filter(Boolean)
+    .slice(0, maxItems)
+    .map((x) => x.slice(0, 4000));
+}
+
+function findChain(name: string): ChainSetting {
+  const c = store.state.chains.find((x) => x.chain === name);
+  if (!c) throw new HttpError(400, `Chaîne inconnue : ${name}. Ajoutez-la dans Réglages.`);
+  return c;
+}
+
+function scanPayload(scan: ScanRun) {
+  return { scan, findings: engine.findingsOf(scan.id) };
+}
+
+const SEVERITIES: FindingSeverity[] = ['critical', 'high', 'medium', 'low'];
+
+// ------------------------------------------------------------------- server
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '2mb' }));
+  if (process.env.K_SERVICE) app.set('trust proxy', 1); // Cloud Run front end
+  app.disable('x-powered-by');
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Frame-Options', 'DENY');
+    next();
+  });
+  app.use('/api', express.json({ limit: '2mb' }));
+  app.use('/api', Auth.csrfGuard);
 
-  // Health
+  // ---- public
   app.get('/api/health', (_req, res) => {
+    res.json({ service: 'polymorphe', version: '0.2.0', status: 'ok' });
+  });
+
+  app.get('/api/auth/status', (req, res) => {
+    const user = auth.sessionUser(req);
     res.json({
-      service: 'polymorphe',
-      version: '0.1.0',
-      status: 'ok',
-      port: 3000,
+      setupRequired: auth.setupRequired,
+      setupTokenRequired: auth.setupRequired,
+      authenticated: Boolean(user),
+      user,
     });
   });
 
-  // Auth & Setup
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', h((req, res) => {
+    const ip = req.ip ?? 'unknown';
+    const wait = auth.lockoutRemaining(ip);
+    if (wait) throw new HttpError(429, `Trop d’échecs. Réessayez dans ${wait} s.`);
+    if (auth.setupRequired) throw new HttpError(409, 'Instance non initialisée : passez par /setup.');
     const { username, password } = req.body || {};
-    if (!password || String(password).length < 4) {
-      return res.status(400).json({ error: 'Mot de passe requis (4 caractères minimum).' });
+    if (!auth.login(username, password)) {
+      auth.recordFailure(ip);
+      store.log('warn', 'auth', `Échec de connexion depuis ${ip}.`);
+      store.commit();
+      throw new HttpError(401, 'Identifiants invalides.');
     }
-    state.authenticatedUser = username?.trim() || 'admin';
-    return res.json({ ok: true, user: state.authenticatedUser });
-  });
+    auth.issueSession(req, res);
+    store.log('info', 'auth', `Connexion ${store.state.auth.user}.`);
+    store.commit();
+    res.json({ ok: true, user: store.state.auth.user });
+  }));
 
-  app.post('/api/setup/complete', (req, res) => {
-    const { llmModel, llmKeyConfigured, chainRpcs } = req.body || {};
-    if (llmModel) state.llm.model = String(llmModel);
-    if (llmKeyConfigured) {
-      state.llm.configured = true;
-      state.llm.keyMasked = 'sk-••••••••••configured';
+  app.post('/api/setup/complete', h((req, res) => {
+    if (!auth.setupRequired) throw new HttpError(409, 'Instance déjà initialisée.');
+    const ip = req.ip ?? 'unknown';
+    const wait = auth.lockoutRemaining(ip);
+    if (wait) throw new HttpError(429, `Trop d’échecs. Réessayez dans ${wait} s.`);
+    const { setupToken, password, llmModel, chainRpcs } = req.body || {};
+    if (!auth.checkSetupToken(setupToken)) {
+      auth.recordFailure(ip);
+      throw new HttpError(403, 'Jeton d’initialisation invalide (affiché dans la console du serveur et dans <data>/setup-token).');
+    }
+    if (typeof password !== 'string' || password.length < PASSWORD_MIN || password.length > PASSWORD_MAX) {
+      throw new HttpError(400, `Mot de passe : ${PASSWORD_MIN} à ${PASSWORD_MAX} caractères.`);
+    }
+    const model = str(llmModel, 80);
+    if (model) {
+      if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new HttpError(400, 'Nom de modèle invalide.');
+      store.state.llm.model = model;
     }
     if (Array.isArray(chainRpcs)) {
       for (const item of chainRpcs) {
-        const target = state.chains.find((c) => c.chain === item.chain);
-        if (target && typeof item.rpcUrl === 'string' && item.rpcUrl.trim()) {
-          target.rpcUrl = item.rpcUrl.trim();
+        const target = store.state.chains.find((c) => c.chain === item?.chain);
+        const url = str(item?.rpcUrl, 2000);
+        if (target && url) {
+          target.rpcUrl = httpsUrl(url, `RPC ${target.chain}`);
           target.rpcConfigured = true;
         }
       }
     }
-    state.setupCompleted = true;
-    appendServerLog('info', 'setup', 'Onboarding Polymorphe complété.');
+    auth.setPassword(password);
+    store.log('info', 'setup', 'Instance initialisée.');
+    store.commit();
+    auth.issueSession(req, res);
     res.json({ ok: true, setupCompleted: true });
+  }));
+
+  // ---- everything below requires a session
+  app.use('/api', auth.middleware());
+
+  app.post('/api/auth/logout', (req, res) => {
+    auth.revokeSession(req, res);
+    res.json({ ok: true });
   });
 
   // Scans
   app.get('/api/scans', (_req, res) => {
-    const summaries = state.scans.map((scan) => ({
-      ...scan,
-      findingsCount: state.findings.filter((f) => f.scanId === scan.id).length,
-    }));
-    res.json({ scans: summaries });
-  });
-
-  app.post('/api/scans', (req, res) => {
-    const { targetUrl, rpcUrl, surface = 'all', repoCount = 1 } = req.body || {};
-    if (!targetUrl || !String(targetUrl).trim()) {
-      return res.status(400).json({ error: 'L’URL du programme, le dépôt ou le chemin local est requis.' });
-    }
-
-    const meta = classifyTarget(String(targetUrl));
-    const chainSetting = state.chains.find((c) => c.chain === meta.chain);
-    if (rpcUrl && String(rpcUrl).trim() && chainSetting) {
-      chainSetting.rpcUrl = String(rpcUrl).trim();
-      chainSetting.rpcConfigured = true;
-    }
-
-    const rpcConfigured = Boolean(
-      (rpcUrl && String(rpcUrl).trim()) || chainSetting?.rpcConfigured
-    );
-
-    const g0 = evaluateG0({
-      targetKind: meta.targetKind,
-      scopeKind: meta.scopeKind,
-      programActive: meta.programActive,
-      programStatusText: meta.programStatusText,
-      programArtifactUrl: String(targetUrl).trim(),
-      verbatimImpacts: meta.verbatimImpacts,
-      chain: meta.chain,
-      rpcConfigured,
-      fundsAtRiskUsd: meta.fundsAtRiskUsd,
-      minFundsAtRiskUsd: chainSetting?.minFundsAtRiskUsd ?? 100_000,
-      blockNumber: meta.scopeKind === 'deployed' ? 21_240_955 : undefined,
-      contractAddress:
-        meta.scopeKind === 'deployed' ? '0x88b4E2c191aC2d004f7A9012B110e8F991C32a04' : undefined,
-      provenanceMatch: meta.scopeKind === 'deployed' ? 'matched' : 'n/a',
-      pinnedCommit: 'a41e80b91c22940f7d104e8a92c11d4e66f09b22',
-      dwellDays: meta.dwellDays,
-      knownIssuesCount: meta.knownIssuesCount,
-      tombstones: meta.tombstones,
+    res.json({
+      scans: store.state.scans.map((scan) => ({ ...scan, findingsCount: engine.findingsOf(scan.id).length })),
     });
+  });
 
-    const id = `scan-${Date.now().toString(36)}`;
-    const now = new Date().toISOString();
+  app.post('/api/scans', h((req, res) => {
+    const { targetUrl, rpcUrl, surface = 'all', repoCount = 1 } = req.body || {};
+    const target = str(targetUrl, 2000);
+    if (!target) throw new HttpError(400, 'L’URL du programme, le dépôt ou le chemin local est requis.');
+    if (!['all', 'onchain', 'seam'].includes(surface)) throw new HttpError(400, 'Surface invalide.');
+    const meta = classifyTarget(target);
+    if (meta.targetKind === 'repo') validateRepoUrl(target);
 
-    const scan: ScanRun = {
-      id,
-      taskId: `task-${id}`,
-      targetUrl: String(targetUrl).trim(),
-      programName: meta.programName,
-      targetKind: meta.targetKind,
-      scopeKind: meta.scopeKind,
-      chain: meta.chain,
-      maxBountyUsd: meta.maxBountyUsd,
-      status:
-        g0.decision === 'no_go'
-          ? 'no_go'
-          : g0.decision === 'needs_input'
-            ? 'needs_input'
-            : 'hunting',
-      createdAt: now,
-      updatedAt: now,
-      surface,
-      repoCount: Number(repoCount) || 1,
-      executionMode: 'guided_autonomous',
-      workerCount: 1,
-      budget: {
-        tokensUsed: 0,
-        tokensLimit: state.llm.defaultTokenBudget,
-        elapsedSeconds: 38,
-        maxSeconds: 1800,
-        history: [{ tokensK: 0, hypothesesClosed: 0, findingsCount: 0 }],
-      },
-      steps: [
-        {
-          key: 'intake',
-          status: 'done',
-          detail:
-            meta.targetKind === 'program'
-              ? `${meta.verbatimImpacts.length} impacts verbatim récupérés.`
-              : 'Mode labo détecté (aucun impact inventé).',
-          updatedAt: now,
-        },
-        {
-          key: 'clone_build',
-          status: 'done',
-          detail: 'Clone --filter=blob:none + forge build OK (FOUNDRY_FFI=false).',
-          updatedAt: now,
-        },
-        {
-          key: 'ingest',
-          status: 'done',
-          detail: 'Ingest persisté dans sc_ingest_results.',
-          updatedAt: now,
-        },
-        {
-          key: 'g0',
-          status:
-            g0.decision === 'no_go'
-              ? 'blocked'
-              : g0.decision === 'needs_input'
-                ? 'needs_input'
-                : 'done',
-          detail: `Verdict déterministe : ${g0.decision.toUpperCase()}`,
-          updatedAt: now,
-        },
-        {
-          key: 'threat_model',
-          status: g0.decision === 'go' ? 'running' : g0.decision === 'no_go' ? 'blocked' : 'pending',
-          detail: g0.decision === 'go' ? 'Génération du brouillon…' : 'En attente de G0.',
-          updatedAt: now,
-        },
-        {
-          key: 'hunt',
-          status: g0.decision === 'go' ? 'pending' : g0.decision === 'no_go' ? 'blocked' : 'pending',
-          detail: g0.decision === 'go' ? 'Démarrage 1 worker (LOCK #2).' : 'Bloqué par G0 (LOCK #1).',
-          updatedAt: now,
-        },
-        { key: 'candidates', status: 'pending', detail: 'En attente.', updatedAt: now },
-      ],
-      g0,
-      ingest: {
-        buildOk: true,
-        foundryFfiDisabled: true,
-        npmScriptsIgnored: true,
-        buildLog:
-          '[⠒] Solc 0.8.26 finished in 1.48s\nCompiler run successful! (FOUNDRY_FFI=false, --ignore-scripts)',
-        contractsCount: 8,
-        untestedMonetaryFunctions: [
-          {
-            contract: 'VaultCore',
-            functionName: 'settleWithdrawal',
-            fileLine: 'src/VaultCore.sol:148',
-            reason: 'Fonction monétaire non couverte par la suite de tests existante.',
-          },
-        ],
-        negativeSpaceSummary: 'Slither exécuté (1 hit). Aderyn non installé (signalé).',
-        staticHits: [
-          {
-            tool: 'slither',
-            rule: 'reentrancy-benign',
-            fileLine: 'src/VaultCore.sol:153',
-            severity: 'medium',
-            message: 'Mise à jour de r.settled après safeTransfer.',
-          },
-        ],
-        provenanceMatch:
-          meta.scopeKind === 'deployed' && rpcConfigured
-            ? {
-                chain: meta.chain,
-                address: '0x88b4E2c191aC2d004f7A9012B110e8F991C32a04',
-                blockNumber: 21_240_955,
-                pinnedCommit: 'a41e80b91c22940f7d104e8a92c11d4e66f09b22',
-                status: 'matched',
-              }
-            : undefined,
-      },
-      threatModel: {
-        provenance: 'pipeline_auto',
-        updatedAt: now,
-        summary: 'En attente de G0.',
-        verbatimImpacts: meta.verbatimImpacts,
-        exclusions: [],
-        tombstones: meta.tombstones,
-        invariants: [],
-        trustBoundaries: [],
-      },
-      hypotheses: [],
-      hunterLogs: [
-        {
-          id: `log-init-${id}`,
-          timestamp: now.slice(11, 19),
-          role: 'system',
-          message: `Scan créé (${meta.targetKind} / ${meta.scopeKind}). Verdict G0 = ${g0.decision.toUpperCase()}.`,
-        },
-      ],
-      seamEvents: [],
-    };
-
-    // If G0 = GO, execute autonomous hunt immediately (LOCK #1 satisfied)
-    if (canHunt(scan)) {
-      seedHuntForScan(scan);
+    const chain = 'ethereum';
+    if (str(rpcUrl)) {
+      const c = findChain(chain);
+      c.rpcUrl = httpsUrl(rpcUrl, 'RPC');
+      c.rpcConfigured = true;
     }
 
-    state.scans.unshift(scan);
-    appendServerLog('info', 'scan.orchestrator', `Nouveau scan ${scan.id} (${scan.g0.decision}).`);
+    const scan = buildScanRecord(target, meta, { chain, surface, repoCount: Number(repoCount) || 1, tokensLimit: store.state.llm.defaultTokenBudget });
+    store.state.scans.unshift(scan);
+    store.log('info', 'scan.orchestrator', `Nouveau scan ${scan.id} (${meta.targetKind}).`);
+    store.commit();
+    engine.startPipeline(scan, { rebuild: true });
     res.status(201).json({ scan });
-  });
+  }));
 
-  app.get('/api/scans/:id', (req, res) => {
-    const scan = state.scans.find((s) => s.id === req.params.id);
-    if (!scan) return res.status(404).json({ error: 'Scan introuvable.' });
-    const findings = state.findings.filter((f) => f.scanId === scan.id);
-    res.json({ scan, findings });
-  });
+  app.get('/api/scans/:id', h((req, res) => {
+    res.json(scanPayload(getScan(req.params.id)));
+  }));
 
-  // SSE stream for scan updates
-  app.get('/api/scans/:id/events', (req, res) => {
-    const scanId = req.params.id;
+  app.get('/api/scans/:id/events', h((req, res) => {
+    const scanId = getScan(req.params.id).id;
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
-
     let set = sseClients.get(scanId);
     if (!set) {
       set = new Set();
@@ -583,576 +284,638 @@ async function startServer() {
     }
     set.add(res);
     res.write(`event: connected\ndata: ${JSON.stringify({ scanId })}\n\n`);
-
+    const ping = setInterval(() => res.write(': ping\n\n'), 25_000);
     req.on('close', () => {
+      clearInterval(ping);
       set?.delete(res);
     });
-  });
+  }));
 
-  // Provide missing input (e.g., RPC URL for NEEDS_INPUT)
-  app.post('/api/scans/:id/input', (req, res) => {
-    const scan = state.scans.find((s) => s.id === req.params.id);
-    if (!scan) return res.status(404).json({ error: 'Scan introuvable.' });
+  // Operator attestation of the program page (L1, L2, L5, L6 + scope for L3/L4)
+  app.post('/api/scans/:id/program-scope', h((req, res) => {
+    const scan = getScan(req.params.id);
+    if (scan.targetKind !== 'program') throw new HttpError(409, 'Scope programme réservé aux cibles « programme ».');
+    const b = req.body || {};
+    if (!['active', 'paused', 'closed'].includes(b.status)) throw new HttpError(400, 'Statut : active, paused ou closed.');
+    if (!['deployed', 'commit_anchored'].includes(b.scopeKind)) throw new HttpError(400, 'scopeKind : deployed ou commit_anchored.');
+    const chain = findChain(str(b.chain, 40) || 'ethereum');
+    const addresses = lines(b.scopeAddresses, 100);
+    const bad = addresses.filter((a) => !ADDRESS_RE.test(a));
+    if (bad.length) throw new HttpError(400, `Adresse(s) invalide(s) : ${bad.slice(0, 3).join(', ')}`);
+    const listedAt = str(b.listedAt, 40);
+    if (listedAt && Number.isNaN(Date.parse(listedAt))) throw new HttpError(400, 'Date de listing invalide.');
+    const maxBounty = b.maxBountyUsd === null || b.maxBountyUsd === '' || b.maxBountyUsd === undefined ? null : Number(b.maxBountyUsd);
+    if (maxBounty !== null && (!Number.isFinite(maxBounty) || maxBounty < 0)) throw new HttpError(400, 'Prime max invalide.');
+    const repoUrl = str(b.repoUrl, 2000) ? validateRepoUrl(str(b.repoUrl, 2000)) : undefined;
+    const pinnedCommit = str(b.pinnedCommit, 64) || undefined;
+    if (pinnedCommit && !SHA_RE.test(pinnedCommit)) throw new HttpError(400, 'Commit : SHA hexadécimal attendu.');
 
-    const { rpcUrl, chain } = req.body || {};
-    const targetChain = String(chain || scan.g0.missingChain || scan.chain);
-    if (!rpcUrl || !String(rpcUrl).trim().startsWith('http')) {
-      return res.status(400).json({ error: 'Fournissez une URL RPC HTTP/HTTPS valide.' });
-    }
-
-    const chainEntry = state.chains.find((c) => c.chain === targetChain);
-    if (chainEntry) {
-      chainEntry.rpcUrl = String(rpcUrl).trim();
-      chainEntry.rpcConfigured = true;
-    } else {
-      state.chains.push({
-        chain: targetChain,
-        label: targetChain,
-        rpcUrl: String(rpcUrl).trim(),
-        rpcConfigured: true,
-        etherscanKeyMasked: '',
-        minFundsAtRiskUsd: 100_000,
-      });
-    }
-
-    const reEvaluated = evaluateG0({
-      targetKind: scan.targetKind,
-      scopeKind: scan.scopeKind,
-      programActive: true,
-      programStatusText: 'Active · Cantina',
-      programArtifactUrl: scan.targetUrl,
-      verbatimImpacts: scan.threatModel.verbatimImpacts,
-      chain: targetChain,
-      rpcConfigured: true,
-      fundsAtRiskUsd: 31_400_000,
-      minFundsAtRiskUsd: chainEntry?.minFundsAtRiskUsd ?? 100_000,
-      blockNumber: 276_814_220,
-      contractAddress: '0x4F90a11C02b8e21445c8a290b31E991a0441Cc02',
-      provenanceMatch: 'matched',
-      pinnedCommit: 'b129e04a891d22c7e09f11a442d8b7c09a812f33',
-      dwellDays: 58,
-      knownIssuesCount: 1,
-      tombstones: scan.threatModel.tombstones,
-    });
-
-    scan.g0 = reEvaluated;
-    scan.ingest.provenanceMatch = {
-      chain: targetChain,
-      address: '0x4F90a11C02b8e21445c8a290b31E991a0441Cc02',
-      blockNumber: 276_814_220,
-      pinnedCommit: 'b129e04a891d22c7e09f11a442d8b7c09a812f33',
-      status: 'matched',
+    const scope: ProgramScope = {
+      attestedAt: new Date().toISOString(),
+      attestedBy: requestUser(req),
+      sourceUrl: httpsUrl(b.sourceUrl || scan.targetUrl, 'Source'),
+      status: b.status,
+      verbatimImpacts: lines(b.verbatimImpacts),
+      maxBountyUsd: maxBounty,
+      listedAt: listedAt || undefined,
+      knownIssues: lines(b.knownIssues),
+      scopeKind: b.scopeKind,
+      chain: chain.chain,
+      scopeAddresses: addresses,
+      repoUrl,
+      pinnedCommit,
     };
+    const prev = scan.programScope;
+    const rebuild = !scan.workspace || prev?.repoUrl !== repoUrl || prev?.pinnedCommit !== pinnedCommit;
+    scan.programScope = scope;
+    scan.hunterLogs.push({
+      id: newId('log'),
+      timestamp: scope.attestedAt.slice(11, 19),
+      role: 'system',
+      message: `Scope programme attesté par ${scope.attestedBy} (${scope.verbatimImpacts.length} impacts, ${addresses.length} adresse(s)).`,
+    });
+    store.commit();
+    engine.startPipeline(scan, { rebuild: rebuild && Boolean(repoUrl) });
+    res.json(scanPayload(scan));
+  }));
 
-    if (canHunt(scan)) {
-      seedHuntForScan(scan);
-    }
+  // Missing RPC (NEEDS_INPUT): store once in chain settings, then re-measure
+  app.post('/api/scans/:id/input', h((req, res) => {
+    const scan = getScan(req.params.id);
+    const chain = findChain(str(req.body?.chain, 40) || scan.programScope?.chain || scan.chain);
+    chain.rpcUrl = httpsUrl(req.body?.rpcUrl, 'RPC');
+    chain.rpcConfigured = true;
+    store.log('info', 'settings.chains', `RPC ${chain.chain} enregistré.`);
+    store.commit();
+    engine.startPipeline(scan, { rebuild: false });
+    res.json(scanPayload(scan));
+  }));
 
-    appendServerLog('info', 'g0.verdict', `${scan.id} : RPC ${targetChain} enregistré, G0 -> ${scan.g0.decision}.`);
-    pushScanEvent(scan.id, 'scan_updated', { scanId: scan.id, status: scan.status });
-    res.json({ scan, findings: state.findings.filter((f) => f.scanId === scan.id) });
-  });
+  app.post('/api/scans/:id/funds-attestation', h((req, res) => {
+    const scan = getScan(req.params.id);
+    const usd = Number(req.body?.usd);
+    if (!Number.isFinite(usd) || usd < 0) throw new HttpError(400, 'Montant USD invalide.');
+    scan.fundsAttestation = {
+      usd,
+      sourceUrl: httpsUrl(req.body?.sourceUrl, 'Source du TVL'),
+      attestedAt: new Date().toISOString(),
+      attestedBy: requestUser(req),
+    };
+    store.commit();
+    engine.startPipeline(scan, { rebuild: false });
+    res.json(scanPayload(scan));
+  }));
 
-  // Override G0 (NO-GO -> go_override) with >= 20 char reason (LOCK L7)
-  app.post('/api/scans/:id/override-g0', (req, res) => {
-    const scan = state.scans.find((s) => s.id === req.params.id);
-    if (!scan) return res.status(404).json({ error: 'Scan introuvable.' });
+  app.post('/api/scans/:id/rebuild', h((req, res) => {
+    const scan = getScan(req.params.id);
+    if (engine.isBusy(scan.id)) throw new HttpError(409, 'Un job est déjà en cours sur ce scan.');
+    if (scan.status === 'stopped') scan.status = 'running';
+    engine.startPipeline(scan, { rebuild: true });
+    res.json(scanPayload(scan));
+  }));
 
-    const { reason } = req.body || {};
-    const check = validateG0Override(String(reason || ''));
-    if (!check.ok) {
-      return res.status(400).json({ error: check.error });
-    }
-
+  // Override G0 (L7)
+  app.post('/api/scans/:id/override-g0', h((req, res) => {
+    const scan = getScan(req.params.id);
+    const reason = str(req.body?.reason, 2000);
+    const check = validateG0Override(reason);
+    if (!check.ok) throw new HttpError(400, check.error!);
     scan.g0 = {
       ...scan.g0,
       decision: 'go_override',
-      overrideReason: String(reason).trim(),
-      overrideBy: state.authenticatedUser,
+      overrideReason: reason,
+      overrideBy: requestUser(req),
       overrideAt: new Date().toISOString(),
     };
+    store.log('warn', 'g0.override', `${scan.id} forcé en go_override par ${requestUser(req)}.`);
+    store.commit();
+    engine.startPipeline(scan, { rebuild: false });
+    res.json(scanPayload(scan));
+  }));
 
-    if (canHunt(scan)) {
-      seedHuntForScan(scan);
-    }
-
-    appendServerLog('warn', 'g0.override', `${scan.id} forcé en go_override par ${state.authenticatedUser}.`);
-    pushScanEvent(scan.id, 'scan_updated', { scanId: scan.id, status: scan.status });
-    res.json({ scan, findings: state.findings.filter((f) => f.scanId === scan.id) });
-  });
-
-  // Extend budget ("Continuer +N")
-  app.post('/api/scans/:id/budget', (req, res) => {
-    const scan = state.scans.find((s) => s.id === req.params.id);
-    if (!scan) return res.status(404).json({ error: 'Scan introuvable.' });
-
-    const addTokens = Number(req.body?.addTokens) || 50_000;
-    const now = new Date().toISOString();
-    scan.budget.tokensLimit += addTokens;
-    scan.budget.tokensUsed = Math.min(scan.budget.tokensLimit, scan.budget.tokensUsed + 18_500);
-    scan.budget.history.push({
-      tokensK: Math.round(scan.budget.tokensUsed / 1000),
-      hypothesesClosed: scan.hypotheses.filter((h) => h.outcome !== 'in_progress').length + 1,
-      findingsCount: state.findings.filter((f) => f.scanId === scan.id).length,
-    });
-
-    // Close any remaining in_progress hypothesis with artifact proof
-    const openHyp = scan.hypotheses.find((h) => h.outcome === 'in_progress');
-    if (openHyp) {
-      openHyp.outcome = 'killed_by_artifact';
-      openHyp.artifactId = `art-forge-cont-${Date.now().toString(36)}`;
-      openHyp.reason = 'Vérifié par test Foundry : domainSeparator inclut block.chainid dynamiquement.';
-      openHyp.updatedAt = now;
-    }
-
-    scan.status = 'done';
-    scan.updatedAt = now;
+  // Extend budget: raises the limit. Closes nothing, produces no artifact.
+  app.post('/api/scans/:id/budget', h((req, res) => {
+    const scan = getScan(req.params.id);
+    const add = Number(req.body?.addTokens);
+    if (!Number.isInteger(add) || add <= 0 || add > 5_000_000) throw new HttpError(400, 'addTokens : entier entre 1 et 5 000 000.');
+    scan.budget.tokensLimit += add;
+    if (scan.status === 'stopped') scan.status = 'hunting';
     scan.hunterLogs.push({
-      id: `log-budget-${Date.now()}`,
-      timestamp: now.slice(11, 19),
-      role: 'worker',
-      message: `Budget étendu (+${(addTokens / 1000).toFixed(0)}k tokens). Hypothèse restante clôturée avec artefact.`,
-      tokensUsed: scan.budget.tokensUsed,
-    });
-
-    pushScanEvent(scan.id, 'scan_updated', { scanId: scan.id, status: scan.status });
-    res.json({ scan });
-  });
-
-  // Stop scan
-  app.post('/api/scans/:id/stop', (req, res) => {
-    const scan = state.scans.find((s) => s.id === req.params.id);
-    if (!scan) return res.status(404).json({ error: 'Scan introuvable.' });
-    scan.status = 'stopped';
-    scan.updatedAt = new Date().toISOString();
-    scan.hunterLogs.push({
-      id: `log-stop-${Date.now()}`,
-      timestamp: scan.updatedAt.slice(11, 19),
+      id: newId('log'),
+      timestamp: new Date().toISOString().slice(11, 19),
       role: 'system',
-      message: 'Scan arrêté manuellement par l’opérateur.',
+      message: `Budget étendu de ${add.toLocaleString('fr-FR')} tokens par ${requestUser(req)}.`,
     });
-    pushScanEvent(scan.id, 'scan_updated', { scanId: scan.id, status: scan.status });
+    engine.recomputeStatus(scan);
+    store.commit();
+    pushScanEvent(scan.id, 'scan_updated', { scanId: scan.id });
     res.json({ scan });
-  });
+  }));
 
-  // Threat model merge update (G10)
-  app.put('/api/scans/:id/threat-model', (req, res) => {
-    const scan = state.scans.find((s) => s.id === req.params.id);
-    if (!scan) return res.status(404).json({ error: 'Scan introuvable.' });
+  app.post('/api/scans/:id/stop', h((req, res) => {
+    const scan = getScan(req.params.id);
+    const cancelled = engine.cancel(scan.id);
+    scan.status = 'stopped';
+    scan.hunterLogs.push({
+      id: newId('log'),
+      timestamp: new Date().toISOString().slice(11, 19),
+      role: 'system',
+      message: `Scan arrêté par l’opérateur (${cancelled} job(s) annulé(s)).`,
+    });
+    store.commit();
+    pushScanEvent(scan.id, 'scan_updated', { scanId: scan.id });
+    res.json({ scan });
+  }));
+
+  // Threat model (G10 merge)
+  app.put('/api/scans/:id/threat-model', h((req, res) => {
+    const scan = getScan(req.params.id);
     scan.threatModel = mergeThreatModel(scan.threatModel, req.body || {});
-    scan.updatedAt = scan.threatModel.updatedAt;
-    const tmStep = scan.steps.find((s) => s.key === 'threat_model');
-    if (tmStep) {
-      tmStep.detail = 'Édité et approuvé par opérateur (operator_approved).';
-      tmStep.updatedAt = scan.updatedAt;
+    const tm = scan.steps.find((s) => s.key === 'threat_model');
+    if (tm) {
+      tm.status = 'done';
+      tm.detail = 'Édité et approuvé par l’opérateur (operator_approved).';
+      tm.updatedAt = scan.threatModel.updatedAt;
     }
-    appendServerLog('info', 'threat_model', `${scan.id} : threat model mis à jour par fusion (operator_approved).`);
+    store.commit();
     pushScanEvent(scan.id, 'threat_model_updated', { scanId: scan.id });
     res.json({ threatModel: scan.threatModel, scan });
-  });
+  }));
 
-  // Server-side Gemini 4 Neon: generate/refine threat model
-  app.post('/api/scans/:id/ai/threat-model', async (req, res) => {
-    const scan = state.scans.find((s) => s.id === req.params.id);
-    if (!scan) return res.status(404).json({ error: 'Scan introuvable.' });
+  app.post('/api/scans/:id/ai/threat-model', h(async (req, res) => {
+    const scan = getScan(req.params.id);
+    if (!canHunt(scan)) throw new HttpError(409, 'LOCK #1 : G0 doit être GO ou override.');
+    if (!isGeminiConfigured()) throw new HttpError(409, 'GEMINI_API_KEY non configurée.');
+    if (!engine.projectDir(scan)) throw new HttpError(409, 'Build requis : le threat model doit être ancré dans le code.');
     try {
-      const model = state.llm.model || GEMINI_MODEL;
-      const draft = await generateThreatModelWithGemini(scan, model);
-      const now = new Date().toISOString();
-      scan.threatModel = {
-        ...scan.threatModel,
-        provenance: 'pipeline_auto',
-        updatedAt: now,
-        summary: draft.summary,
-        invariants: draft.invariants,
-        trustBoundaries: draft.trustBoundaries,
-      };
-      scan.updatedAt = now;
-      scan.hunterLogs.push({
-        id: `log-ai-tm-${Date.now()}`,
-        timestamp: now.slice(11, 19),
-        role: 'planner',
-        message: `Threat model affiné par ${model} (${draft.invariants.length} invariants, ${draft.trustBoundaries.length} frontières).`,
-      });
-      appendServerLog('info', 'gemini.threat_model', `${scan.id} : threat model généré via ${model}.`);
-      pushScanEvent(scan.id, 'threat_model_updated', { scanId: scan.id });
-      res.json({ threatModel: scan.threatModel, scan, model });
+      await engine.draftThreatModel(scan);
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Erreur lors de l’appel Gemini.';
-      appendServerLog('warn', 'gemini.threat_model', `${scan.id} : ${message}`);
-      res.status(502).json({ error: message });
+      throw new HttpError(502, err instanceof Error ? err.message : 'Erreur Gemini.');
     }
-  });
+    res.json({ threatModel: scan.threatModel, scan, model: store.state.llm.model });
+  }));
 
-  // Server-side Gemini 4 Neon: generate targeted attack hypotheses (R6)
-  app.post('/api/scans/:id/ai/hypotheses', async (req, res) => {
-    const scan = state.scans.find((s) => s.id === req.params.id);
-    if (!scan) return res.status(404).json({ error: 'Scan introuvable.' });
+  app.post('/api/scans/:id/ai/hypotheses', h(async (req, res) => {
+    const scan = getScan(req.params.id);
+    if (!canHunt(scan)) throw new HttpError(409, 'LOCK #1 : G0 doit être GO ou override.');
+    if (!isGeminiConfigured()) throw new HttpError(409, 'GEMINI_API_KEY non configurée.');
+    let created;
     try {
-      const model = state.llm.model || GEMINI_MODEL;
-      const generated = await generateHypothesesWithGemini(scan, model);
-      const now = new Date().toISOString();
-      const created = generated.map((item, idx) => ({
-        id: `hyp-ai-${Date.now().toString(36)}-${idx + 1}`,
-        scanId: scan.id,
-        door: item.door,
-        title: item.title,
-        targetFileLine: item.targetFileLine,
-        outcome: 'in_progress' as const,
-        updatedAt: now,
-      }));
-      scan.hypotheses = [...created, ...scan.hypotheses];
-      scan.updatedAt = now;
-      scan.hunterLogs.push({
-        id: `log-ai-hyp-${Date.now()}`,
-        timestamp: now.slice(11, 19),
-        role: 'planner',
-        message: `${created.length} nouvelles hypothèses générées par ${model} (R6).`,
-      });
-      appendServerLog('info', 'gemini.hypotheses', `${scan.id} : +${created.length} hypothèses via ${model}.`);
-      pushScanEvent(scan.id, 'hypothesis_updated', { scanId: scan.id });
-      res.json({ hypotheses: created, scan, model });
+      created = await engine.draftHypotheses(scan);
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Erreur lors de l’appel Gemini.';
-      appendServerLog('warn', 'gemini.hypotheses', `${scan.id} : ${message}`);
-      res.status(502).json({ error: message });
+      if (err instanceof WorkspaceError) throw new HttpError(409, err.message);
+      throw new HttpError(502, err instanceof Error ? err.message : 'Erreur Gemini.');
     }
-  });
+    engine.recomputeStatus(scan);
+    store.commit();
+    res.json({ hypotheses: created, scan, model: store.state.llm.model });
+  }));
 
-  // Hypotheses list & close_hypothesis (R9)
-  app.get('/api/scans/:id/hypotheses', (req, res) => {
-    const scan = state.scans.find((s) => s.id === req.params.id);
-    if (!scan) return res.status(404).json({ error: 'Scan introuvable.' });
-    res.json({
-      hypotheses: scan.hypotheses,
-      canCloseWithoutFindings: canCloseScanWithoutFindings(scan.hypotheses),
-    });
-  });
+  // Hypotheses (R6 / R9)
+  app.get('/api/scans/:id/hypotheses', h((req, res) => {
+    const scan = getScan(req.params.id);
+    res.json({ hypotheses: scan.hypotheses, canCloseWithoutFindings: canCloseScanWithoutFindings(scan.hypotheses) });
+  }));
 
-  app.post('/api/scans/:id/hypotheses/:hypId/close', (req, res) => {
-    const scan = state.scans.find((s) => s.id === req.params.id);
-    if (!scan) return res.status(404).json({ error: 'Scan introuvable.' });
-    const hyp = scan.hypotheses.find((h) => h.id === req.params.hypId);
-    if (!hyp) return res.status(404).json({ error: 'Hypothèse introuvable.' });
+  app.post('/api/scans/:id/hypotheses', h((req, res) => {
+    const scan = getScan(req.params.id);
+    if (!canHunt(scan)) throw new HttpError(409, 'LOCK #1 : G0 doit être GO ou override.');
+    const title = str(req.body?.title, 500);
+    const door = req.body?.door;
+    if (!title) throw new HttpError(400, 'Titre requis.');
+    if (!['door_a_untested', 'invariant', 'seam', 'tombstone_sibling'].includes(door)) throw new HttpError(400, 'Door invalide.');
+    const targetFileLine = str(req.body?.targetFileLine, 300);
+    const hyp = {
+      id: newId('hyp'),
+      scanId: scan.id,
+      door,
+      title,
+      targetFileLine,
+      targetVerified: verifyFileLine(engine.projectDir(scan), targetFileLine),
+      outcome: 'in_progress' as const,
+      testRunIds: [],
+      updatedAt: new Date().toISOString(),
+    };
+    scan.hypotheses.unshift(hyp);
+    engine.recomputeStatus(scan);
+    store.commit();
+    pushScanEvent(scan.id, 'hypothesis_updated', { scanId: scan.id });
+    res.status(201).json({ hypothesis: hyp, scan });
+  }));
 
-    const { outcome, artifactId, reason } = req.body || {};
-    const finalOutcome = classifyHypothesisClosure(outcome, artifactId);
+  app.post('/api/scans/:id/hypotheses/:hypId/test', h((req, res) => {
+    const scan = getScan(req.params.id);
+    if (!canHunt(scan)) throw new HttpError(409, 'LOCK #1 : G0 doit être GO ou override.');
+    if (!engine.projectDir(scan)) throw new HttpError(409, 'Build requis.');
+    const run = engine.submitHypothesisTest(scan, req.params.hypId, validatePocSource(req.body?.pocSource));
+    res.status(202).json({ run, scan });
+  }));
+
+  app.post('/api/scans/:id/hypotheses/:hypId/close', h((req, res) => {
+    const scan = getScan(req.params.id);
+    const hyp = scan.hypotheses.find((x) => x.id === req.params.hypId);
+    if (!hyp) throw new HttpError(404, 'Hypothèse introuvable.');
+    const { outcome, artifactId } = req.body || {};
+    if (!['candidate', 'killed_by_artifact', 'abandoned_unproven'].includes(outcome)) throw new HttpError(400, 'Outcome invalide.');
+    const run = engine.run(str(artifactId, 100));
+    const ownRun = run && run.scanId === scan.id && run.subjectId === hyp.id ? run : null;
+    if (outcome !== 'abandoned_unproven' && str(artifactId) && !ownRun) {
+      throw new HttpError(400, 'R9 : artifactId doit désigner un run exécuté de CETTE hypothèse.');
+    }
+    const finalOutcome = classifyHypothesisClosure(outcome, ownRun);
     hyp.outcome = finalOutcome;
-    hyp.artifactId = finalOutcome === 'killed_by_artifact' ? String(artifactId).trim() : undefined;
-    hyp.reason = String(reason || '').trim() || 'Clôturée par l’opérateur.';
+    hyp.artifactId = finalOutcome === 'abandoned_unproven' ? undefined : ownRun!.id;
+    hyp.reason = str(req.body?.reason, 2000) || 'Clôturée par l’opérateur.';
     hyp.updatedAt = new Date().toISOString();
-
     scan.hunterLogs.push({
-      id: `log-close-${Date.now()}`,
+      id: newId('log'),
       timestamp: hyp.updatedAt.slice(11, 19),
       role: 'system',
-      message: `close_hypothesis(${hyp.id}) -> ${finalOutcome}${hyp.artifactId ? ` [${hyp.artifactId}]` : ' (sans artefact exécuté, R9)'}`,
+      message: `close_hypothesis(${hyp.id}) -> ${finalOutcome}${hyp.artifactId ? ` [${hyp.artifactId}]` : outcome !== finalOutcome ? ' (rétrogradé : aucun run passant, R9)' : ''}`,
     });
-
+    engine.recomputeStatus(scan);
+    store.commit();
     pushScanEvent(scan.id, 'hypothesis_updated', { scanId: scan.id, hypothesisId: hyp.id });
     res.json({ hypothesis: hyp, scan });
-  });
+  }));
 
-  // Human path to create a finding from PoC (G6, behind LOCK #5)
-  app.post('/api/tasks/:id/findings/from-poc', (req, res) => {
-    const scan = state.scans.find((s) => s.taskId === req.params.id || s.id === req.params.id);
-    if (!scan) return res.status(404).json({ error: 'Scan/Tâche introuvable.' });
+  app.get('/api/runs/:id', h((req, res) => {
+    const run = engine.run(req.params.id);
+    if (!run) throw new HttpError(404, 'Run introuvable.');
+    res.json({ run });
+  }));
 
-    const { title, severity = 'high', affectedFileLine, pocSource, summary } = req.body || {};
-    if (!title || !pocSource || !String(pocSource).includes('function test')) {
-      return res.status(400).json({
-        error: 'LOCK #5 : un titre et un source_code PoC Foundry contenant une fonction test_* sont requis.',
-      });
+  app.get('/api/scans/:id/runs', h((req, res) => {
+    const scan = getScan(req.params.id);
+    res.json({ runs: store.state.runs.filter((r) => r.scanId === scan.id).map(({ output, ...rest }) => rest) });
+  }));
+
+  // Human path to a finding: PoC replayed in clean room before it becomes a candidate (LOCK #5)
+  app.post('/api/tasks/:id/findings/from-poc', h((req, res) => {
+    const scan = store.state.scans.find((s) => s.taskId === req.params.id || s.id === req.params.id);
+    if (!scan) throw new HttpError(404, 'Scan/Tâche introuvable.');
+    const projectDir = engine.projectDir(scan);
+    if (!projectDir) throw new HttpError(409, 'Build requis : un PoC se rejoue contre le code construit.');
+    const b = req.body || {};
+    const title = str(b.title, 300);
+    if (!title) throw new HttpError(400, 'Titre requis.');
+    const severity = SEVERITIES.includes(b.severity) ? (b.severity as FindingSeverity) : null;
+    if (!severity) throw new HttpError(400, 'Sévérité invalide.');
+    const pocSource = validatePocSource(b.pocSource);
+    const affectedFileLine = str(b.affectedFileLine, 300);
+    if (!verifyFileLine(projectDir, affectedFileLine)) {
+      throw new HttpError(400, `${affectedFileLine || 'fichier:ligne'} introuvable dans le workspace construit.`);
     }
+    const impacts = scan.programScope?.verbatimImpacts ?? [];
+    const impact = str(b.verbatimImpactLine, 4000);
+    if (impact && !impacts.includes(impact)) throw new HttpError(400, 'La ligne d’impact doit être une des lignes verbatim attestées.');
+
+    const [file, lineStr] = affectedFileLine.split(':');
+    const src = fs.readFileSync(path.join(projectDir, file), 'utf8');
+    const srcLines = src.split('\n');
+    const lineNo = Number(lineStr);
+    const fnName = /function\s+([A-Za-z0-9_$]+)/.exec(srcLines.slice(Math.max(0, lineNo - 1), lineNo + 2).join('\n'))?.[1];
+    const affectedCode = (fnName && extractFunction(src, fnName)?.body) || srcLines.slice(lineNo - 1, lineNo + 24).join('\n');
 
     const now = new Date().toISOString();
-    const id = `FND-MAN-${Date.now().toString(36).slice(-4).toUpperCase()}`;
+    const id = newId('FND').toUpperCase();
     const finding: Finding = {
       id,
       scanId: scan.id,
-      title: String(title).trim(),
+      title,
       severity,
-      status: 'candidate',
+      status: 'replaying',
       source: 'human_from_poc',
       createdAt: now,
-      summary: String(summary || '').trim() || 'Finding soumis manuellement depuis PoC Foundry vérifié.',
-      verbatimImpactLine: scan.threatModel.verbatimImpacts[0] ?? null,
-      affectedFileLine: String(affectedFileLine || 'src/Contract.sol:1').trim(),
-      affectedCode: '// Extrait issu du worktree scanné',
-      pocFile: `test/poc/${id}.t.sol`,
-      pocSource: String(pocSource),
-      pocReplayCommand: `FOUNDRY_FFI=false FORK_RPC_URL=$RPC forge test --match-path test/poc/${id}.t.sol -vvvv`,
-      pocReplayTrace: `[PASS] PoC clean-room verified (FOUNDRY_FFI=false)\nClean-room re-execution: PASS (2/2 runs deterministic)`,
-      cleanRoomVerified: true,
+      summary: str(b.summary, 8000),
+      verbatimImpactLine: impact || null,
+      affectedFileLine,
+      affectedCode: affectedCode.slice(0, 12_000),
+      pocFile: `${scan.workspace!.layout.test}/polymorphe/${id.replace(/[^A-Za-z0-9_]/g, '_')}.t.sol`,
+      pocSource,
+      pocReplayCommand: '',
+      pocReplayTrace: '',
+      cleanRoomVerified: false,
       disconfirmer: {
-        status: 'clear',
-        ranAt: now,
-        legitimateAlternativeTest:
-          'Déclenchement automatique post-soumission (LOCK #4) : aucune séquence légitime équivalente détectée.',
-        notes: 'Contre-vérification terminée sans blocage.',
+        status: 'not_run',
+        ranAt: null,
+        legitimateAlternativeTest: '',
+        notes: '',
         canKillFinding: false,
       },
-      recommendation: 'Corriger la validation d’état avant l’interaction externe et ajouter un test de non-régression.',
+      recommendation: str(b.recommendation, 8000),
       fixReviews: [],
     };
+    store.state.findings.unshift(finding);
+    engine.submitFindingReplay(scan, finding);
+    res.status(202).json({ finding });
+  }));
 
-    state.findings.unshift(finding);
-    scan.hunterLogs.push({
-      id: `log-human-${Date.now()}`,
-      timestamp: now.slice(11, 19),
-      role: 'disconfirmer',
-      message: `Finding humain ${finding.id} créé via from-poc (LOCK #5 OK) + disconfirmer déclenché.`,
-    });
-
-    res.status(201).json({ finding });
-  });
-
-  // Findings list & detail
+  // Findings
   app.get('/api/findings', (_req, res) => {
-    const enriched = state.findings.map((f) => {
-      const scan = state.scans.find((s) => s.id === f.scanId);
-      return {
-        ...f,
-        programName: scan?.programName ?? 'Inconnu',
-        targetKind: scan?.targetKind ?? 'local',
-        scopeKind: scan?.scopeKind ?? 'commit_anchored',
-      };
+    res.json({
+      findings: store.state.findings.map((f) => {
+        const scan = engine.scan(f.scanId);
+        return {
+          ...f,
+          programName: scan?.programName ?? 'Inconnu',
+          targetKind: scan?.targetKind ?? 'local',
+          scopeKind: scan?.scopeKind ?? 'commit_anchored',
+        };
+      }),
     });
-    res.json({ findings: enriched });
   });
 
-  app.get('/api/findings/:id', (req, res) => {
-    const finding = state.findings.find((f) => f.id === req.params.id);
-    if (!finding) return res.status(404).json({ error: 'Finding introuvable.' });
-    const scan = state.scans.find((s) => s.id === finding.scanId);
-    res.json({ finding, scan });
-  });
+  app.get('/api/findings/:id', h((req, res) => {
+    const { finding, scan } = getFinding(req.params.id);
+    res.json({ finding, scan, replayRun: engine.run(finding.replayRunId) });
+  }));
 
   // PATCH rejects operator_confirmed (G9 / LOCK #3)
-  app.patch('/api/findings/:id', (req, res) => {
-    const finding = state.findings.find((f) => f.id === req.params.id);
-    if (!finding) return res.status(404).json({ error: 'Finding introuvable.' });
-
-    const { status } = req.body || {};
+  app.patch('/api/findings/:id', h((req, res) => {
+    const { finding, scan } = getFinding(req.params.id);
+    const { status, verbatimImpactLine } = req.body || {};
     if (status === 'operator_confirmed') {
-      return res.status(403).json({
-        error: 'LOCK #3 (G9) : PATCH ne peut pas définir operator_confirmed. Utilisez la feuille de sign-off POST /api/findings/:id/signoff.',
-      });
+      throw new HttpError(403, 'LOCK #3 (G9) : utilisez la feuille de sign-off POST /api/findings/:id/signoff.');
     }
-    if (status === 'rejected' || status === 'hold' || status === 'candidate') {
+    if (verbatimImpactLine !== undefined) {
+      const impact = str(verbatimImpactLine, 4000);
+      if (impact && !(scan.programScope?.verbatimImpacts ?? []).includes(impact)) {
+        throw new HttpError(400, 'La ligne d’impact doit être une des lignes verbatim attestées.');
+      }
+      if (finding.status === 'operator_confirmed') throw new HttpError(409, 'Finding déjà validé : impact figé.');
+      finding.verbatimImpactLine = impact || null;
+    }
+    if (status !== undefined) {
+      if (!['rejected', 'hold', 'candidate'].includes(status)) throw new HttpError(400, 'Statut invalide.');
+      if (status === 'candidate' && !finding.cleanRoomVerified) {
+        throw new HttpError(409, 'LOCK #5 : « candidat » exige un rejeu clean-room réussi.');
+      }
       finding.status = status;
-      return res.json({ finding });
     }
-    return res.status(400).json({ error: 'Statut invalide.' });
-  });
+    store.commit();
+    res.json({ finding });
+  }));
 
-  // Sign-off (U-1 / LOCK #3)
-  app.post('/api/findings/:id/signoff', (req, res) => {
-    const finding = state.findings.find((f) => f.id === req.params.id);
-    if (!finding) return res.status(404).json({ error: 'Finding introuvable.' });
-    const scan = state.scans.find((s) => s.id === finding.scanId);
-    if (!scan) return res.status(404).json({ error: 'Scan parent introuvable.' });
+  app.post('/api/findings/:id/replay', h((req, res) => {
+    const { finding, scan } = getFinding(req.params.id);
+    if (!engine.projectDir(scan)) throw new HttpError(409, 'Build requis.');
+    if (finding.status === 'operator_confirmed') throw new HttpError(409, 'Finding déjà validé.');
+    finding.status = 'replaying';
+    engine.submitFindingReplay(scan, finding);
+    res.status(202).json({ finding });
+  }));
 
-    const check = validateOperatorSignoff(req.body || {}, scan.scopeKind);
-    if (!check.ok) {
-      return res.status(400).json({ error: check.error });
-    }
-
+  app.post('/api/findings/:id/signoff', h((req, res) => {
+    const { finding, scan } = getFinding(req.params.id);
+    const b = req.body || {};
+    const check = validateOperatorSignoff(
+      {
+        impactJustification: str(b.impactJustification, 8000),
+        preconditionJustification: str(b.preconditionJustification, 8000),
+        deploymentCheck: b.deploymentCheck,
+        deploymentJustification: str(b.deploymentJustification, 8000),
+        blockNumber: b.blockNumber === undefined || b.blockNumber === null ? undefined : Number(b.blockNumber),
+      },
+      scan.scopeKind,
+      finding
+    );
+    if (!check.ok) throw new HttpError(400, check.error!);
     finding.status = 'operator_confirmed';
     finding.signoff = {
       confirmedAt: new Date().toISOString(),
-      confirmedBy: state.authenticatedUser,
-      impactJustification: String(req.body.impactJustification).trim(),
-      preconditionJustification: String(req.body.preconditionJustification).trim(),
-      deploymentCheck: req.body.deploymentCheck,
-      deploymentJustification: String(req.body.deploymentJustification).trim(),
-      blockNumber: req.body.blockNumber ? Number(req.body.blockNumber) : undefined,
+      confirmedBy: requestUser(req),
+      impactJustification: str(b.impactJustification, 8000),
+      preconditionJustification: str(b.preconditionJustification, 8000),
+      deploymentCheck: b.deploymentCheck,
+      deploymentJustification: str(b.deploymentJustification, 8000),
+      blockNumber: b.blockNumber ? Number(b.blockNumber) : undefined,
     };
-
-    appendServerLog('info', 'sc.signoff', `${finding.id} validé (${finding.signoff.deploymentCheck}).`);
+    store.log('info', 'sc.signoff', `${finding.id} validé par ${requestUser(req)} (${finding.signoff.deploymentCheck}).`);
+    store.commit();
     res.json({ finding });
-  });
+  }));
 
-  // Export (U-1 + L9)
-  app.post('/api/findings/:id/export', (req, res) => {
-    const finding = state.findings.find((f) => f.id === req.params.id);
-    if (!finding) return res.status(404).json({ error: 'Finding introuvable.' });
-    const scan = state.scans.find((s) => s.id === finding.scanId);
-    if (!scan) return res.status(404).json({ error: 'Scan parent introuvable.' });
-
+  app.post('/api/findings/:id/export', h((req, res) => {
+    const { finding, scan } = getFinding(req.params.id);
     const gate = canExportFinding(finding, scan);
-    if (!gate.allowed) {
-      return res.status(403).json({ error: gate.reason, code: gate.code });
+    if (!gate.allowed) throw new HttpError(403, gate.reason!, gate.code);
+    const format = (['immunefi', 'cantina', 'sherlock'].includes(req.body?.format) ? req.body.format : 'immunefi') as ExportFormat;
+    const report = generateBountyReport(finding, scan, format, engine.run(finding.replayRunId) ?? undefined);
+    res.json({ filename: report.filename, content: report.content, format });
+  }));
+
+  // Fix-review: replays the PoC on the PR head / commit. Never posts anything to GitHub.
+  app.post('/api/findings/:id/fix-review', h((req, res) => {
+    const { finding, scan } = getFinding(req.params.id);
+    if (!finding.cleanRoomVerified) throw new HttpError(409, 'Le PoC doit d’abord passer sur le commit de base.');
+    if (!engine.projectDir(scan) || scan.workspace?.source !== 'git') {
+      throw new HttpError(409, 'Fix-review : workspace Git construit requis (pas de remote pour une copie locale).');
     }
-
-    const format = (req.body?.format || 'immunefi') as ExportFormat;
-    const report = generateBountyReport(finding, scan, format);
-    res.json({
-      filename: report.filename,
-      content: report.content,
-      format,
-    });
-  });
-
-  // Fix-review by PR / commit URL (replays PoC + sibling sinks; NEVER auto-posts to GitHub)
-  app.post('/api/findings/:id/fix-review', (req, res) => {
-    const finding = state.findings.find((f) => f.id === req.params.id);
-    if (!finding) return res.status(404).json({ error: 'Finding introuvable.' });
-    const scan = state.scans.find((s) => s.id === finding.scanId);
-
-    const prOrCommitUrl = String(req.body?.prOrCommitUrl || '').trim();
-    if (!prOrCommitUrl) {
-      return res.status(400).json({ error: 'Fournissez une URL de PR GitHub ou un SHA de commit.' });
+    const input = str(req.body?.prOrCommitUrl, 500);
+    let fetchRef: string;
+    if (SHA_RE.test(input)) {
+      fetchRef = input;
+    } else {
+      let u: URL;
+      try {
+        u = new URL(input);
+      } catch {
+        throw new HttpError(400, 'URL de PR GitHub, URL de commit ou SHA attendu.');
+      }
+      const parts = u.pathname.split('/').filter(Boolean);
+      const repo = `https://github.com/${parts[0]}/${parts[1]}.git`;
+      if (u.hostname !== 'github.com' || parts.length < 4) throw new HttpError(400, 'URL GitHub de PR ou de commit attendue.');
+      if (repo.toLowerCase() !== scan.workspace.repoUrl.toLowerCase()) {
+        throw new HttpError(400, `La PR/commit doit appartenir à ${scan.workspace.repoUrl}.`);
+      }
+      if (parts[2] === 'pull' && /^\d+$/.test(parts[3])) fetchRef = `pull/${parts[3]}/head`;
+      else if (parts[2] === 'commit' && SHA_RE.test(parts[3])) fetchRef = parts[3];
+      else throw new HttpError(400, 'URL GitHub de PR (/pull/N) ou de commit (/commit/SHA) attendue.');
     }
+    const record = engine.submitFixReview(scan, finding, input, fetchRef);
+    res.status(202).json({ fixReview: record, finding });
+  }));
 
-    const lower = prOrCommitUrl.toLowerCase();
-    const stillRepro =
-      lower.includes('wip') || lower.includes('unfixed') || lower.includes('revert') || lower.includes('bad');
-    const partial = lower.includes('partial') || lower.includes('sibling');
-    const verdict: FixReviewRecord['verdict'] = stillRepro
-      ? 'still_reproducible'
-      : partial
-        ? 'partial'
-        : 'fixed';
-
-    const baseCommit = scan?.ingest.provenanceMatch?.pinnedCommit?.slice(0, 7) ?? '9f84c21';
-    const headCommit = prOrCommitUrl.slice(-7).replace(/[^a-f0-9]/gi, 'a').padEnd(7, '9');
-
-    const siblingSinks: FixReviewRecord['siblingSinks'] = [
-      {
-        fileLine: finding.affectedFileLine,
-        functionName: 'primary_sink',
-        status: verdict === 'still_reproducible' ? 'vulnerable_sibling' : 'clean',
-        note:
-          verdict === 'still_reproducible'
-            ? 'Le PoC reproduit toujours l’exploitation sur le head fourni.'
-            : 'Le PoC échoue comme attendu (revert ReentrancyGuard / InvalidSignature).',
-      },
-      {
-        fileLine: 'src/queue/AegisWithdrawalQueue.sol:274',
-        functionName: 'claimSingleWithCallback',
-        status: verdict === 'fixed' ? 'clean' : 'vulnerable_sibling',
-        note:
-          verdict === 'fixed'
-            ? 'Modificateur nonReentrant et CEI également appliqués sur le sink frère.'
-            : 'Sink frère non couvert par le patch : vérifier claimSingleWithCallback.',
-      },
-    ];
-
-    const summaryMarkdown = `### Fix Review — ${finding.id} (${verdict.toUpperCase()})
-- **Target**: \`${prOrCommitUrl}\` (\`${baseCommit}..${headCommit}\`)
-- **PoC Replay**: ${verdict === 'still_reproducible' ? 'Exploit STILL REPRODUCIBLE (exit 0)' : 'Exploit BLOCKED / FIXED (revert expected)'}
-- **Sibling Sinks**: ${siblingSinks.map((s) => `${s.functionName} (${s.status})`).join(', ')}
-- **Note**: Generated locally by Polymorphe (not auto-posted to PR).`;
-
-    const record: FixReviewRecord = {
-      id: `fr-${Date.now().toString(36)}`,
-      findingId: finding.id,
-      prOrCommitUrl,
-      ranAt: new Date().toISOString(),
-      baseCommit,
-      headCommit,
-      verdict,
-      pocReplayExitCode: verdict === 'still_reproducible' ? 0 : 1,
-      pocReplayOutput:
-        verdict === 'still_reproducible'
-          ? `[PASS] PoC STILL SUCCEEDS on ${headCommit} — vulnerability remains exploitable.`
-          : `[FAIL: EvmError: Revert] PoC blocked on ${headCommit} — mitigation verified against clean-room replay.`,
-      siblingSinks,
-      summaryMarkdown,
-    };
-
-    finding.fixReviews.unshift(record);
-    appendServerLog('info', 'fix_review', `${finding.id} rejoué sur ${prOrCommitUrl} -> ${verdict}.`);
-    res.json({ fixReview: record, finding });
-  });
-
-  // Server-side Gemini 4 Neon: re-run R13 disconfirmer check (LOCK #4, R10: never kills finding)
-  app.post('/api/findings/:id/ai/disconfirmer', async (req, res) => {
-    const finding = state.findings.find((f) => f.id === req.params.id);
-    if (!finding) return res.status(404).json({ error: 'Finding introuvable.' });
-    const scan = state.scans.find((s) => s.id === finding.scanId);
-    if (!scan) return res.status(404).json({ error: 'Scan parent introuvable.' });
+  // Disconfirmer (LOCK #4, R10: never kills a finding)
+  app.post('/api/findings/:id/ai/disconfirmer', h(async (req, res) => {
+    const { finding, scan } = getFinding(req.params.id);
+    if (!isGeminiConfigured()) throw new HttpError(409, 'GEMINI_API_KEY non configurée.');
+    if (!finding.cleanRoomVerified) throw new HttpError(409, 'Disconfirmer : un rejeu réussi est requis d’abord.');
     try {
-      const model = state.llm.model || GEMINI_MODEL;
-      const review = await runDisconfirmerWithGemini(finding, scan, model);
-      finding.disconfirmer = review;
-      appendServerLog('info', 'gemini.disconfirmer', `${finding.id} : R13 réévalué via ${model} -> ${review.status}.`);
-      res.json({ finding, disconfirmer: review, model });
+      await engine.disconfirm(scan, finding);
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Erreur lors de la contre-vérification Gemini.';
-      appendServerLog('warn', 'gemini.disconfirmer', `${finding.id} : ${message}`);
-      res.status(502).json({ error: message });
+      if (err instanceof WorkspaceError) throw new HttpError(409, err.message);
+      throw new HttpError(502, err instanceof Error ? err.message : 'Erreur Gemini.');
     }
-  });
+    res.json({ finding, disconfirmer: finding.disconfirmer, model: store.state.llm.model });
+  }));
 
-  // Settings & Doctor
-  app.get('/api/doctor', (_req, res) => {
-    res.json({ checks: state.doctor });
-  });
+  // Settings & doctor
+  let doctorCache: { at: number; checks: DoctorCheck[] } | null = null;
+  app.get('/api/doctor', h(async (_req, res) => {
+    if (!doctorCache || Date.now() - doctorCache.at > 60_000) {
+      const spec: Array<Omit<DoctorCheck, 'installed' | 'version'> & { args?: string[] }> = [
+        { tool: 'forge', category: 'sc', required: true, installCmd: 'curl -L https://foundry.paradigm.xyz | bash && foundryup', impact: 'Build, ingest et rejeu des PoC.' },
+        { tool: 'git', category: 'core', required: true, installCmd: 'apt-get install -y git', impact: 'Clone blobless, checkout du commit épinglé, fetch des PR.' },
+        { tool: 'bwrap', category: 'core', required: true, installCmd: 'apt-get install -y bubblewrap', impact: 'Sandbox des builds et des PoC (code non fiable).' },
+        { tool: 'cast', category: 'sc', required: false, installCmd: 'foundryup', impact: 'Non utilisé par le serveur (lectures RPC natives) ; utile en manuel.' },
+        { tool: 'anvil', category: 'sc', required: false, installCmd: 'foundryup', impact: 'Non utilisé par cette version.' },
+        { tool: 'slither', category: 'sc', required: false, installCmd: 'pipx install slither-analyzer', impact: 'Non exécuté par cette version (analyse statique manuelle).' },
+        { tool: 'aderyn', category: 'sc', required: false, installCmd: 'cargo install aderyn', impact: 'Non exécuté par cette version.' },
+        { tool: 'halmos', category: 'sc', required: false, installCmd: 'pipx install halmos', impact: 'Non exécuté par cette version.' },
+      ];
+      const checks: DoctorCheck[] = [];
+      for (const s of spec) {
+        const version = await toolVersion(s.tool, s.args);
+        let installed = version !== null;
+        let v = version ?? 'Non installé';
+        if (s.tool === 'bwrap' && installed) {
+          installed = await probeSandbox();
+          if (!installed) v = `${v} — namespaces refusés (sandbox inutilisable)`;
+        }
+        checks.push({ tool: s.tool, category: s.category, required: s.required, installCmd: s.installCmd, impact: s.impact, installed, version: v });
+      }
+      checks.push({
+        tool: 'GEMINI_API_KEY',
+        category: 'core',
+        required: false,
+        installed: isGeminiConfigured(),
+        version: isGeminiConfigured() ? 'configurée' : 'absente',
+        installCmd: 'export GEMINI_API_KEY=… (ou Secrets AI Studio)',
+        impact: 'Brouillons threat model, hypothèses et disconfirmer.',
+      });
+      doctorCache = { at: Date.now(), checks };
+    }
+    res.json({ checks: doctorCache.checks });
+  }));
 
-  app.get('/api/settings', (_req, res) => {
+  app.get('/api/settings', h(async (_req, res) => {
     const configured = isGeminiConfigured();
     res.json({
       llm: {
-        ...state.llm,
+        ...store.state.llm,
         configured,
-        keyMasked: configured
-          ? 'Connectée via Settings > Secrets (GEMINI_API_KEY)'
-          : 'Non configurée (Settings > Secrets)',
+        keyMasked: configured ? 'GEMINI_API_KEY présente (environnement serveur)' : 'GEMINI_API_KEY absente',
       },
-      chains: state.chains,
-      setupCompleted: state.setupCompleted,
-      user: state.authenticatedUser,
+      chains: store.state.chains,
+      execution: {
+        allowUnsandboxedExecution: store.state.settings.allowUnsandboxedExecution,
+        sandboxAvailable: await engine.sandboxAvailable(),
+      },
+      setupCompleted: !auth.setupRequired,
+      user: store.state.auth.user,
     });
-  });
+  }));
 
   app.get('/api/settings/chains', (_req, res) => {
-    res.json({ chains: state.chains });
+    res.json({ chains: store.state.chains });
   });
 
-  app.put('/api/settings/chains', (req, res) => {
+  app.put('/api/settings/chains', h((req, res) => {
     const { chains } = req.body || {};
-    if (!Array.isArray(chains)) {
-      return res.status(400).json({ error: 'Format chains invalide.' });
-    }
-    state.chains = chains.map((c) => ({
-      chain: String(c.chain),
-      label: String(c.label || c.chain),
-      rpcUrl: String(c.rpcUrl || '').trim(),
-      rpcConfigured: Boolean(String(c.rpcUrl || '').trim()),
-      etherscanKeyMasked: String(c.etherscanKeyMasked || ''),
-      minFundsAtRiskUsd: Number(c.minFundsAtRiskUsd) || 100_000,
-    }));
-    appendServerLog('info', 'settings.chains', 'Configuration RPC & seuils mise à jour.');
-    res.json({ chains: state.chains });
-  });
+    if (!Array.isArray(chains) || chains.length === 0 || chains.length > 50) throw new HttpError(400, 'Format chains invalide.');
+    store.state.chains = chains.map((c: Partial<ChainSetting>) => {
+      const chain = str(c.chain, 40);
+      if (!/^[a-z0-9-]+$/.test(chain)) throw new HttpError(400, `Identifiant de chaîne invalide : ${chain}`);
+      const rpcUrl = str(c.rpcUrl, 2000);
+      const feed = str(c.nativeUsdFeed, 42);
+      if (feed && !ADDRESS_RE.test(feed)) throw new HttpError(400, `Feed invalide pour ${chain}.`);
+      const chainId = c.chainId === null || c.chainId === undefined || (c.chainId as unknown) === '' ? null : Number(c.chainId);
+      if (chainId !== null && (!Number.isInteger(chainId) || chainId <= 0)) throw new HttpError(400, `chainId invalide pour ${chain}.`);
+      return {
+        chain,
+        label: str(c.label, 80) || chain,
+        chainId,
+        rpcUrl: rpcUrl ? httpsUrl(rpcUrl, `RPC ${chain}`) : '',
+        rpcConfigured: Boolean(rpcUrl),
+        nativeUsdFeed: feed,
+        nativeUsdFeedDescription: str(c.nativeUsdFeedDescription, 80) || 'ETH / USD',
+        etherscanKeyMasked: '',
+        minFundsAtRiskUsd: Math.max(0, Number(c.minFundsAtRiskUsd) || 0),
+      };
+    });
+    store.log('info', 'settings.chains', 'Configuration RPC & seuils mise à jour.');
+    store.commit();
+    res.json({ chains: store.state.chains });
+  }));
 
-  app.put('/api/settings/llm', (req, res) => {
-    const { provider, model, defaultTokenBudget, apiKeyUpdated } = req.body || {};
-    if (provider) state.llm.provider = String(provider);
-    if (model) state.llm.model = String(model);
-    if (defaultTokenBudget) state.llm.defaultTokenBudget = Number(defaultTokenBudget);
-    if (apiKeyUpdated) {
-      state.llm.configured = true;
-      state.llm.keyMasked = 'sk-••••••••••updated';
+  app.put('/api/settings/llm', h((req, res) => {
+    const { provider, model, defaultTokenBudget } = req.body || {};
+    if (provider !== undefined) store.state.llm.provider = str(provider, 80) || store.state.llm.provider;
+    if (model !== undefined) {
+      const m = str(model, 80);
+      if (!/^[A-Za-z0-9._-]+$/.test(m)) throw new HttpError(400, 'Nom de modèle invalide.');
+      store.state.llm.model = m;
     }
-    res.json({ llm: state.llm });
-  });
+    if (defaultTokenBudget !== undefined) {
+      const n = Number(defaultTokenBudget);
+      if (!Number.isInteger(n) || n < 1000 || n > 10_000_000) throw new HttpError(400, 'Budget : entier entre 1 000 et 10 000 000.');
+      store.state.llm.defaultTokenBudget = n;
+    }
+    store.commit();
+    const configured = isGeminiConfigured();
+    res.json({ llm: { ...store.state.llm, configured, keyMasked: configured ? 'GEMINI_API_KEY présente' : 'GEMINI_API_KEY absente' } });
+  }));
 
-  // Advanced SC subset
+  app.put('/api/settings/execution', h((req, res) => {
+    const v = req.body?.allowUnsandboxedExecution;
+    if (typeof v !== 'boolean') throw new HttpError(400, 'allowUnsandboxedExecution : booléen requis.');
+    store.state.settings.allowUnsandboxedExecution = v;
+    store.log('warn', 'settings.execution', `Exécution hors sandbox ${v ? 'AUTORISÉE' : 'interdite'} par ${requestUser(req)}.`);
+    store.commit();
+    res.json({ execution: store.state.settings });
+  }));
+
   app.get('/api/advanced', (_req, res) => {
-    const snap = createInitialAdvancedSnapshot(state.scans);
-    snap.serverLogs = state.logs;
+    const model = store.state.llm.model;
+    const llmOn = isGeminiConfigured();
+    const snap: AdvancedSnapshot = {
+      llmPool: [
+        { id: 'slot-1', provider: store.state.llm.provider, model, role: 'planner (threat model + hypothèses)', active: llmOn },
+        { id: 'slot-2', provider: store.state.llm.provider, model, role: 'disconfirmer (R13)', active: llmOn },
+      ],
+      agents: [
+        {
+          name: 'threat_modeler',
+          role: 'Brouillon post-build ancré dans le code réel (pipeline_auto)',
+          lock: 'R12, R16, G10 (merge)',
+          guidanceExcerpt: 'Reçoit la liste des fichiers et le corps des fonctions Door A. N’invente aucun impact hors des lignes verbatim attestées.',
+        },
+        {
+          name: 'planner',
+          role: 'Génère des hypothèses ; chaque file:line est vérifié contre le workspace',
+          lock: 'R6, LOCK #1',
+          guidanceExcerpt: 'Une hypothèse ne se ferme en kill ou candidat que via un run forge exécuté et passant (R9).',
+        },
+        {
+          name: 'disconfirmer',
+          role: 'Contre-vérification après un rejeu réussi',
+          lock: 'LOCK #4, R10, R13',
+          guidanceExcerpt: 'Reçoit la sortie réelle du rejeu. Signale uniquement ; ne peut jamais tuer un candidat.',
+        },
+      ],
+      skills: [
+        { name: 'sc-foundry-cleanroom', scope: 'PoC Verification', enabled: true, description: 'forge test dans une copie fraîche, FOUNDRY_FFI=false, sandbox bwrap, deux répétitions.' },
+        { name: 'sc-fix-review-replay', scope: 'Fix Review', enabled: true, description: 'Rejoue le PoC sur la tête de PR / le commit. Aucune publication sur GitHub.' },
+        { name: 'sc-patchlag-siblings', scope: 'Fix Review', enabled: false, description: 'Recherche des sinks frères : non implémentée.' },
+        { name: 'sc-web2-web3-seam', scope: 'Web2 ↔ Web3', enabled: false, description: 'Capture dApp : non implémentée.' },
+      ],
+      mcpTools: [],
+      serverLogs: store.state.logs,
+      capturedTraffic: [],
+    };
     res.json(snap);
   });
 
-  // Vite dev / static production middleware
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'Route API inconnue.' });
+  });
+
+  // Vite dev / static production
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(__dirname, 'dist');
@@ -1162,9 +925,14 @@ async function startServer() {
     });
   }
 
-  const PORT = 3000;
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Polymorphe server listening on http://localhost:${PORT}`);
+  const PORT = Number(process.env.PORT) || 3000;
+  const HOST = process.env.HOST || (process.env.K_SERVICE ? '0.0.0.0' : '127.0.0.1');
+  app.listen(PORT, HOST, () => {
+    console.log(`Polymorphe server listening on http://${HOST}:${PORT}`);
+    console.log(`Data directory: ${store.dataDir}`);
+    if (auth.setupToken) {
+      console.log(`Setup token (first run only): ${auth.setupToken}`);
+    }
   });
 }
 

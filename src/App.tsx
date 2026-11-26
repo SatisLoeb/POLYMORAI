@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api, type EnrichedFinding, type ScanSummary } from './lib/api';
+import { api, AUTH_REQUIRED_EVENT, type EnrichedFinding, type ScanSummary } from './lib/api';
 import type { Locale } from './types';
 import { Layout, type RouteState } from './components/Layout';
 import { HomeView } from './components/HomeView';
@@ -54,6 +54,7 @@ export default function App() {
     }
   });
 
+  const [authChecked, setAuthChecked] = useState(false);
   const [scans, setScans] = useState<ScanSummary[]>([]);
   const [findings, setFindings] = useState<EnrichedFinding[]>([]);
   const [loadingLists, setLoadingLists] = useState(true);
@@ -80,13 +81,38 @@ export default function App() {
       const [sRes, fRes] = await Promise.all([api.listScans(), api.listFindings()]);
       setScans(sRes.scans);
       setFindings(fRes.findings);
+    } catch {
+      // 401 is handled by the auth-required listener
     } finally {
       setLoadingLists(false);
     }
   }, []);
 
+  // Auth gate: a fresh instance goes to /setup, an anonymous browser to /login.
   useEffect(() => {
-    refreshLists();
+    const gate = async () => {
+      try {
+        const status = await api.authStatus();
+        if (status.setupRequired) {
+          window.history.replaceState({}, '', '/setup');
+          setRoute({ path: '/setup' });
+        } else if (!status.authenticated) {
+          window.history.replaceState({}, '', '/login');
+          setRoute({ path: '/login' });
+        } else {
+          await refreshLists();
+        }
+      } finally {
+        setAuthChecked(true);
+      }
+    };
+    gate();
+    const onAuthRequired = () => {
+      window.history.replaceState({}, '', '/login');
+      setRoute({ path: '/login' });
+    };
+    window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
+    return () => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
   }, [refreshLists]);
 
   useEffect(() => {
@@ -127,6 +153,10 @@ export default function App() {
         return ['Polymorphe', 'Connexion'];
     }
   })();
+
+  if (!authChecked) {
+    return <div className="min-h-screen bg-[#F8F9FB] dark:bg-[#0B0E14]" />;
+  }
 
   return (
     <Layout
@@ -191,9 +221,23 @@ export default function App() {
 
       {route.path === '/advanced' && <AdvancedView />}
 
-      {route.path === '/setup' && <SetupView onComplete={() => navigate({ path: '/' })} />}
+      {route.path === '/setup' && (
+        <SetupView
+          onComplete={() => {
+            refreshLists();
+            navigate({ path: '/' });
+          }}
+        />
+      )}
 
-      {route.path === '/login' && <LoginView onSuccess={() => navigate({ path: '/' })} />}
+      {route.path === '/login' && (
+        <LoginView
+          onSuccess={() => {
+            refreshLists();
+            navigate({ path: '/' });
+          }}
+        />
+      )}
     </Layout>
   );
 }

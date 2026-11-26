@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { AlertTriangle, Check, Square, X } from 'lucide-react';
+import { AlertTriangle, Check, RefreshCw, Square, X } from 'lucide-react';
 import { api, subscribeScanEvents } from '../lib/api';
 import { getT } from '../i18n/translations';
 import type { Finding, Locale, ScanRun } from '../types';
@@ -9,6 +9,7 @@ import { ThreatModelTab } from './scan/ThreatModelTab';
 import { HuntTab } from './scan/HuntTab';
 import { FixReviewTab } from './scan/FixReviewTab';
 import { DappSeamTab } from './scan/DappSeamTab';
+import { NeedsInputPanel, ProgramScopeForm } from './scan/NeedsInputPanel';
 
 interface ScanViewProps {
   scanId: string;
@@ -34,10 +35,8 @@ export function ScanView({
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<ScanTab>('overview');
 
-  // NEEDS_INPUT inline RPC form
-  const [rpcInput, setRpcInput] = useState('');
-  const [submittingRpc, setSubmittingRpc] = useState(false);
-  const [rpcError, setRpcError] = useState<string | null>(null);
+  const [showScopeEditor, setShowScopeEditor] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   // NO-GO Override modal
   const [showOverrideModal, setShowOverrideModal] = useState(false);
@@ -69,24 +68,23 @@ export function ScanView({
     return unsub;
   }, [scanId]);
 
-  const handleSubmitRpc = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const applyUpdate = (data: { scan: ScanRun; findings: Finding[] }) => {
+    setScan(data.scan);
+    setFindings(data.findings);
+    setShowScopeEditor(false);
+    onScanMutated();
+  };
+
+  const handleRebuild = async () => {
     if (!scan) return;
-    setRpcError(null);
-    setSubmittingRpc(true);
+    setActionError(null);
+    setActionBusy(true);
     try {
-      const data = await api.provideScanInput(scan.id, {
-        rpcUrl: rpcInput.trim(),
-        chain: scan.g0.missingChain || scan.chain,
-      });
-      setScan(data.scan);
-      setFindings(data.findings);
-      setRpcInput('');
-      onScanMutated();
+      applyUpdate(await api.rebuildScan(scan.id));
     } catch (err) {
-      setRpcError(err instanceof Error ? err.message : 'URL RPC invalide.');
+      setActionError(err instanceof Error ? err.message : 'Relance refusée.');
     } finally {
-      setSubmittingRpc(false);
+      setActionBusy(false);
     }
   };
 
@@ -117,11 +115,14 @@ export function ScanView({
 
   const handleExtendBudget = async () => {
     if (!scan) return;
+    setActionError(null);
     setActionBusy(true);
     try {
       const { scan: updated } = await api.extendBudget(scan.id, 50_000);
       setScan(updated);
       onScanMutated();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Extension refusée.');
     } finally {
       setActionBusy(false);
     }
@@ -205,7 +206,9 @@ export function ScanView({
               <div className="text-base font-mono font-semibold tabular-nums text-slate-900 dark:text-white">
                 {scan.maxBountyUsd !== null
                   ? `$${scan.maxBountyUsd.toLocaleString('en-US')}`
-                  : 'Mode labo'}
+                  : scan.targetKind === 'program'
+                    ? 'Non attestée'
+                    : 'Mode labo'}
               </div>
             </div>
             <div className="h-8 w-px bg-slate-200 dark:bg-slate-800 hidden sm:block" />
@@ -217,6 +220,26 @@ export function ScanView({
               </div>
             </div>
 
+            {scan.status !== 'running' && (scan.targetKind !== 'program' || scan.programScope?.repoUrl) && (
+              <button
+                type="button"
+                disabled={actionBusy}
+                onClick={handleRebuild}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-md border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Re-cloner &amp; rebuild</span>
+              </button>
+            )}
+            {scan.targetKind === 'program' && scan.programScope && (
+              <button
+                type="button"
+                onClick={() => setShowScopeEditor((v) => !v)}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-md border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
+              >
+                <span>{showScopeEditor ? 'Fermer le scope' : 'Modifier le scope attesté'}</span>
+              </button>
+            )}
             {(scan.status === 'hunting' || scan.status === 'running') && (
               <button
                 type="button"
@@ -271,46 +294,21 @@ export function ScanView({
         </div>
       </section>
 
-      {/* Gate Banner: NEEDS_INPUT (Missing RPC) */}
-      {scan.status === 'needs_input' && (
-        <section className="bg-amber-50/70 dark:bg-amber-950/20 border border-amber-300 dark:border-amber-800/70 rounded-lg p-5 space-y-3">
-          <div className="flex items-start gap-3">
-            <AlertTriangle className="w-4 h-4 text-amber-700 dark:text-amber-400 shrink-0 mt-0.5" />
-            <div>
-              <h2 className="text-sm font-semibold text-slate-900 dark:text-white">
-                {t.scan.needsInputTitle} — RPC <span className="font-mono">{scan.g0.missingChain || scan.chain}</span> manquant
-              </h2>
-              <p className="text-xs text-slate-700 dark:text-slate-300 mt-1">
-                Ce programme est déployé on-chain (L3 / R1, R15). Fournissez un endpoint RPC une seule fois : il sera mémorisé dans les réglages chaîne et G0 sera réévalué immédiatement.
-              </p>
-            </div>
-          </div>
-          <form onSubmit={handleSubmitRpc} className="flex flex-col sm:flex-row gap-2.5 pl-7">
-            <label htmlFor="inline-rpc-input" className="sr-only">
-              Endpoint RPC {scan.chain}
-            </label>
-            <input
-              id="inline-rpc-input"
-              type="url"
-              required
-              value={rpcInput}
-              onChange={(e) => setRpcInput(e.target.value)}
-              placeholder={`https://${scan.chain}-mainnet.g.alchemy.com/v2/...`}
-              className="flex-1 h-9 px-3 text-xs font-mono bg-white dark:bg-[#0B0E14] border border-amber-300 dark:border-amber-700 rounded-md"
-            />
-            <button
-              type="submit"
-              disabled={submittingRpc}
-              className="h-9 px-4 text-xs font-semibold rounded-md bg-slate-900 dark:bg-white text-white dark:text-slate-950 whitespace-nowrap"
-            >
-              {submittingRpc ? 'Vérification G0…' : t.scan.saveRpcAndResume}
-            </button>
-          </form>
-          {rpcError && (
-            <p role="alert" className="pl-7 text-xs font-medium text-red-700 dark:text-red-400">
-              {rpcError}
-            </p>
-          )}
+      {actionError && (
+        <p role="alert" className="text-xs font-medium text-red-700 dark:text-red-400">
+          {actionError}
+        </p>
+      )}
+
+      {/* Gate Banner: NEEDS_INPUT (program scope / RPC / funds attestation) */}
+      {scan.status === 'needs_input' && <NeedsInputPanel scan={scan} onUpdated={applyUpdate} />}
+
+      {showScopeEditor && scan.programScope && (
+        <section className="bg-white dark:bg-[#121722] border border-slate-200 dark:border-slate-800 rounded-lg p-5 space-y-3">
+          <h2 className="text-sm font-semibold text-slate-900 dark:text-white">
+            Scope attesté par {scan.programScope.attestedBy} le {scan.programScope.attestedAt.slice(0, 16).replace('T', ' ')}
+          </h2>
+          <ProgramScopeForm scan={scan} onUpdated={applyUpdate} />
         </section>
       )}
 
@@ -345,9 +343,11 @@ export function ScanView({
         <section className="bg-slate-100 dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 rounded-lg p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="text-xs text-slate-700 dark:text-slate-300">
             <span className="font-semibold text-slate-900 dark:text-white">
-              {t.scan.budgetStoppedTitle}.
+              Scan arrêté.
             </span>{' '}
-            Prolongez le budget pour terminer les hypothèses ouvertes.
+            {scan.budget.tokensUsed >= scan.budget.tokensLimit
+              ? 'Budget tokens épuisé : l’extension relève seulement la limite, elle ne clôt aucune hypothèse.'
+              : 'Arrêté par l’opérateur : relancez via « Re-cloner & rebuild » ou étendez le budget pour reprendre.'}
           </div>
           <button
             type="button"

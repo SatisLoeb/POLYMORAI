@@ -34,10 +34,10 @@ export function ScanStatusLabel({ status }: { status: ScanStatus }) {
   const map: Record<ScanStatus, { text: string; cls: string }> = {
     running: { text: 'En cours', cls: 'text-blue-700 dark:text-blue-400 font-medium' },
     hunting: { text: 'Chasse active', cls: 'text-blue-700 dark:text-blue-400 font-medium' },
-    needs_input: { text: 'En attente (RPC)', cls: 'text-amber-700 dark:text-amber-400 font-medium' },
+    needs_input: { text: 'Entrée requise', cls: 'text-amber-700 dark:text-amber-400 font-medium' },
     no_go: { text: 'Arrêté (NO-GO)', cls: 'text-red-700 dark:text-red-400 font-medium' },
     done: { text: 'Terminé', cls: 'text-emerald-700 dark:text-emerald-400 font-medium' },
-    stopped: { text: 'Budget atteint', cls: 'text-slate-700 dark:text-slate-300 font-medium' },
+    stopped: { text: 'Arrêté', cls: 'text-slate-700 dark:text-slate-300 font-medium' },
     failed: { text: 'Échec', cls: 'text-red-700 dark:text-red-400 font-medium' },
   };
   const item = map[status];
@@ -57,7 +57,9 @@ export function SeverityLabel({ severity }: { severity: FindingSeverity }) {
 
 export function FindingStatusLabel({ status }: { status: FindingStatus }) {
   const map: Record<FindingStatus, { text: string; cls: string }> = {
-    candidate: { text: 'Candidat', cls: 'text-blue-700 dark:text-blue-400 font-medium' },
+    replaying: { text: 'Rejeu en cours', cls: 'text-blue-700 dark:text-blue-400 font-medium' },
+    replay_failed: { text: 'Rejeu échoué', cls: 'text-red-700 dark:text-red-400 font-medium' },
+    candidate: { text: 'Candidat (rejoué)', cls: 'text-blue-700 dark:text-blue-400 font-medium' },
     operator_confirmed: { text: 'Validé (U-1)', cls: 'text-emerald-700 dark:text-emerald-400 font-semibold' },
     rejected: { text: 'Rejeté', cls: 'text-slate-500 dark:text-slate-400 line-through' },
     hold: { text: 'En attente', cls: 'text-amber-700 dark:text-amber-400 font-medium' },

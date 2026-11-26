@@ -1,6 +1,8 @@
 import type {
   AdvancedSnapshot,
+  AuthStatus,
   ChainSetting,
+  ExecRun,
   DeploymentCheckKind,
   DoctorCheck,
   ExportFormat,
@@ -22,16 +24,36 @@ export interface EnrichedFinding extends Finding {
   scopeKind: ScanRun['scopeKind'];
 }
 
+export const AUTH_REQUIRED_EVENT = 'polymorphe:auth-required';
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
     ...init,
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
   });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && data.code === 'AUTH_REQUIRED') {
+    window.dispatchEvent(new Event(AUTH_REQUIRED_EVENT));
+  }
   if (!res.ok) {
     throw new Error(data.error || `Erreur HTTP ${res.status}`);
   }
   return data as T;
+}
+
+export interface ProgramScopeInput {
+  sourceUrl: string;
+  status: 'active' | 'paused' | 'closed';
+  verbatimImpacts: string[];
+  maxBountyUsd: number | null;
+  listedAt?: string;
+  knownIssues: string[];
+  scopeKind: 'deployed' | 'commit_anchored';
+  chain: string;
+  scopeAddresses: string[];
+  repoUrl?: string;
+  pinnedCommit?: string;
 }
 
 export const api = {
@@ -72,9 +94,48 @@ export const api = {
       body: JSON.stringify({ addTokens }),
     }),
 
+  submitProgramScope: (id: string, payload: ProgramScopeInput) =>
+    request<{ scan: ScanRun; findings: Finding[] }>(`/api/scans/${encodeURIComponent(id)}/program-scope`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  submitFundsAttestation: (id: string, payload: { usd: number; sourceUrl: string }) =>
+    request<{ scan: ScanRun; findings: Finding[] }>(`/api/scans/${encodeURIComponent(id)}/funds-attestation`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  rebuildScan: (id: string) =>
+    request<{ scan: ScanRun; findings: Finding[] }>(`/api/scans/${encodeURIComponent(id)}/rebuild`, {
+      method: 'POST',
+      body: '{}',
+    }),
+
+  listRuns: (scanId: string) =>
+    request<{ runs: Omit<ExecRun, 'output'>[] }>(`/api/scans/${encodeURIComponent(scanId)}/runs`),
+
+  getRun: (runId: string) => request<{ run: ExecRun }>(`/api/runs/${encodeURIComponent(runId)}`),
+
+  runHypothesisTest: (scanId: string, hypId: string, pocSource: string) =>
+    request<{ run: ExecRun; scan: ScanRun }>(
+      `/api/scans/${encodeURIComponent(scanId)}/hypotheses/${encodeURIComponent(hypId)}/test`,
+      { method: 'POST', body: JSON.stringify({ pocSource }) }
+    ),
+
+  addHypothesis: (
+    scanId: string,
+    payload: { title: string; door: string; targetFileLine: string }
+  ) =>
+    request<{ scan: ScanRun }>(`/api/scans/${encodeURIComponent(scanId)}/hypotheses`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
   stopScan: (id: string) =>
     request<{ scan: ScanRun }>(`/api/scans/${encodeURIComponent(id)}/stop`, {
       method: 'POST',
+      body: '{}',
     }),
 
   updateThreatModel: (id: string, patch: Partial<ThreatModel>) =>
@@ -111,6 +172,8 @@ export const api = {
       affectedFileLine: string;
       summary: string;
       pocSource: string;
+      verbatimImpactLine?: string;
+      recommendation?: string;
     }
   ) =>
     request<{ finding: Finding }>(
@@ -124,7 +187,21 @@ export const api = {
   listFindings: () => request<{ findings: EnrichedFinding[] }>('/api/findings'),
 
   getFinding: (id: string) =>
-    request<{ finding: Finding; scan: ScanRun }>(`/api/findings/${encodeURIComponent(id)}`),
+    request<{ finding: Finding; scan: ScanRun; replayRun: ExecRun | null }>(
+      `/api/findings/${encodeURIComponent(id)}`
+    ),
+
+  setFindingImpact: (id: string, verbatimImpactLine: string) =>
+    request<{ finding: Finding }>(`/api/findings/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ verbatimImpactLine }),
+    }),
+
+  replayFinding: (id: string) =>
+    request<{ finding: Finding }>(`/api/findings/${encodeURIComponent(id)}/replay`, {
+      method: 'POST',
+      body: '{}',
+    }),
 
   patchFindingStatus: (id: string, status: 'rejected' | 'hold' | 'candidate') =>
     request<{ finding: Finding }>(`/api/findings/${encodeURIComponent(id)}`, {
@@ -168,27 +245,37 @@ export const api = {
   generateThreatModelAI: (scanId: string) =>
     request<{ threatModel: ThreatModel; scan: ScanRun; model: string }>(
       `/api/scans/${encodeURIComponent(scanId)}/ai/threat-model`,
-      { method: 'POST' }
+      { method: 'POST', body: '{}' }
     ),
 
   generateHypothesesAI: (scanId: string) =>
     request<{ scan: ScanRun; model: string }>(
       `/api/scans/${encodeURIComponent(scanId)}/ai/hypotheses`,
-      { method: 'POST' }
+      { method: 'POST', body: '{}' }
     ),
 
   runDisconfirmerAI: (findingId: string) =>
     request<{ finding: Finding; model: string }>(
       `/api/findings/${encodeURIComponent(findingId)}/ai/disconfirmer`,
-      { method: 'POST' }
+      { method: 'POST', body: '{}' }
     ),
 
   getDoctor: () => request<{ checks: DoctorCheck[] }>('/api/doctor'),
 
   getSettings: () =>
-    request<{ llm: LlmSettings; chains: ChainSetting[]; setupCompleted: boolean; user: string }>(
-      '/api/settings'
-    ),
+    request<{
+      llm: LlmSettings;
+      chains: ChainSetting[];
+      execution: { allowUnsandboxedExecution: boolean; sandboxAvailable: boolean };
+      setupCompleted: boolean;
+      user: string;
+    }>('/api/settings'),
+
+  saveExecution: (allowUnsandboxedExecution: boolean) =>
+    request<{ execution: { allowUnsandboxedExecution: boolean } }>('/api/settings/execution', {
+      method: 'PUT',
+      body: JSON.stringify({ allowUnsandboxedExecution }),
+    }),
 
   saveChains: (chains: ChainSetting[]) =>
     request<{ chains: ChainSetting[] }>('/api/settings/chains', {
@@ -196,12 +283,7 @@ export const api = {
       body: JSON.stringify({ chains }),
     }),
 
-  saveLlm: (payload: {
-    provider?: string;
-    model?: string;
-    defaultTokenBudget?: number;
-    apiKeyUpdated?: boolean;
-  }) =>
+  saveLlm: (payload: { provider?: string; model?: string; defaultTokenBudget?: number }) =>
     request<{ llm: LlmSettings }>('/api/settings/llm', {
       method: 'PUT',
       body: JSON.stringify(payload),
@@ -210,8 +292,9 @@ export const api = {
   getAdvanced: () => request<AdvancedSnapshot>('/api/advanced'),
 
   completeSetup: (payload: {
+    setupToken: string;
+    password: string;
     llmModel?: string;
-    llmKeyConfigured?: boolean;
     chainRpcs?: Array<{ chain: string; rpcUrl: string }>;
   }) =>
     request<{ ok: boolean }>('/api/setup/complete', {
@@ -224,6 +307,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     }),
+
+  logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST', body: '{}' }),
+
+  authStatus: () => request<AuthStatus>('/api/auth/status'),
 };
 
 export function subscribeScanEvents(scanId: string, onUpdate: () => void): () => void {

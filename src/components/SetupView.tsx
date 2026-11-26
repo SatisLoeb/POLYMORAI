@@ -9,25 +9,30 @@ interface SetupViewProps {
 
 export function SetupView({ onComplete }: SetupViewProps) {
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
+  const [setupToken, setSetupToken] = useState('');
   const [password, setPassword] = useState('');
   const [passwordConfirm, setPasswordConfirm] = useState('');
   const [llmModel, setLlmModel] = useState('gemini-4-neon');
-  const [llmEnvReady, setLlmEnvReady] = useState(true);
-  const [ethRpc, setEthRpc] = useState('https://eth-mainnet.g.alchemy.com/v2/demo-masked-key');
+  const [ethRpc, setEthRpc] = useState('');
   const [arbRpc, setArbRpc] = useState('');
   const [doctor, setDoctor] = useState<DoctorCheck[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [finishing, setFinishing] = useState(false);
 
+  // The doctor endpoint needs a session: it is fetched once the instance has been claimed.
   useEffect(() => {
-    api.getDoctor().then((d) => setDoctor(d.checks));
-  }, []);
+    if (step === 4) api.getDoctor().then((d) => setDoctor(d.checks)).catch(() => undefined);
+  }, [step]);
 
   const handleNext = () => {
     setError(null);
     if (step === 1) {
-      if (password && password.length < 8) {
-        setError('Le mot de passe opérateur doit contenir au moins 8 caractères.');
+      if (!setupToken.trim()) {
+        setError('Le jeton d’initialisation est requis (console du serveur ou fichier setup-token).');
+        return;
+      }
+      if (password.length < 12) {
+        setError('Le mot de passe opérateur doit contenir au moins 12 caractères.');
         return;
       }
       if (password !== passwordConfirm) {
@@ -37,27 +42,33 @@ export function SetupView({ onComplete }: SetupViewProps) {
       setStep(2);
     } else if (step === 2) {
       setStep(3);
-    } else if (step === 3) {
-      setStep(4);
     }
   };
 
-  const handleFinish = async () => {
+  const handleClaim = async () => {
+    setError(null);
     setFinishing(true);
     try {
       await api.completeSetup({
+        setupToken: setupToken.trim(),
+        password,
         llmModel,
-        llmKeyConfigured: llmEnvReady,
         chainRpcs: [
-          { chain: 'ethereum', rpcUrl: ethRpc },
-          { chain: 'arbitrum', rpcUrl: arbRpc },
-        ],
+          { chain: 'ethereum', rpcUrl: ethRpc.trim() },
+          { chain: 'arbitrum', rpcUrl: arbRpc.trim() },
+        ].filter((c) => c.rpcUrl),
       });
-      onComplete();
+      setPassword('');
+      setPasswordConfirm('');
+      setStep(4);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Initialisation refusée.');
     } finally {
       setFinishing(false);
     }
   };
+
+  const handleFinish = () => onComplete();
 
   const stepLabels = [
     '1. Mot de passe',
@@ -113,8 +124,21 @@ export function SetupView({ onComplete }: SetupViewProps) {
               Compte opérateur local (admin)
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Définissez un mot de passe pour protéger l’interface locale et signer les validations U-1.
+              Définissez un mot de passe pour protéger l’interface et signer les validations U-1. Le jeton d’initialisation est affiché au démarrage du serveur (et écrit dans <code className="font-mono">&lt;data&gt;/setup-token</code>) : il empêche un tiers de revendiquer l’instance avant vous.
             </p>
+            <div>
+              <label htmlFor="setup-token" className="block text-xs font-medium mb-1">
+                Jeton d’initialisation
+              </label>
+              <input
+                id="setup-token"
+                type="text"
+                autoComplete="off"
+                value={setupToken}
+                onChange={(e) => setSetupToken(e.target.value)}
+                className="w-full h-10 px-3 text-sm font-mono bg-[#F8F9FB] dark:bg-[#0B0E14] border border-slate-300 dark:border-slate-700 rounded-md"
+              />
+            </div>
             <div>
               <label htmlFor="setup-pass" className="block text-xs font-medium mb-1">
                 Mot de passe opérateur
@@ -124,7 +148,7 @@ export function SetupView({ onComplete }: SetupViewProps) {
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                placeholder="8 caractères minimum"
+                placeholder="12 caractères minimum"
                 className="w-full h-10 px-3 text-sm bg-[#F8F9FB] dark:bg-[#0B0E14] border border-slate-300 dark:border-slate-700 rounded-md"
               />
             </div>
@@ -149,7 +173,7 @@ export function SetupView({ onComplete }: SetupViewProps) {
               Modèle LLM de chasse (Google Gemini)
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              La clé API est injectée côté serveur dans <code className="font-mono">GEMINI_API_KEY</code> via <strong>Settings &gt; Secrets</strong>.
+              La clé API est lue côté serveur dans <code className="font-mono">GEMINI_API_KEY</code> (Secrets AI Studio ou <code className="font-mono">.env</code>). Sans clé, la chasse reste manuelle : aucun brouillon LLM n’est simulé.
             </p>
             <div>
               <label htmlFor="setup-model" className="block text-xs font-medium mb-1">
@@ -163,14 +187,6 @@ export function SetupView({ onComplete }: SetupViewProps) {
                 className="w-full h-10 px-3 text-sm font-mono bg-[#F8F9FB] dark:bg-[#0B0E14] border border-slate-300 dark:border-slate-700 rounded-md"
               />
             </div>
-            <label className="flex items-center gap-2 text-xs text-slate-700 dark:text-slate-300">
-              <input
-                type="checkbox"
-                checked={llmEnvReady}
-                onChange={(e) => setLlmEnvReady(e.target.checked)}
-              />
-              <span>Utiliser le secret serveur configuré dans l’environnement</span>
-            </label>
           </div>
         )}
 
@@ -191,6 +207,7 @@ export function SetupView({ onComplete }: SetupViewProps) {
                 type="text"
                 value={ethRpc}
                 onChange={(e) => setEthRpc(e.target.value)}
+                placeholder="https://…"
                 className="w-full h-10 px-3 text-xs font-mono bg-[#F8F9FB] dark:bg-[#0B0E14] border border-slate-300 dark:border-slate-700 rounded-md"
               />
             </div>
@@ -203,7 +220,7 @@ export function SetupView({ onComplete }: SetupViewProps) {
                 type="text"
                 value={arbRpc}
                 onChange={(e) => setArbRpc(e.target.value)}
-                placeholder="https://arb-mainnet.g.alchemy.com/v2/..."
+                placeholder="https://…"
                 className="w-full h-10 px-3 text-xs font-mono bg-[#F8F9FB] dark:bg-[#0B0E14] border border-slate-300 dark:border-slate-700 rounded-md"
               />
             </div>
@@ -231,7 +248,7 @@ export function SetupView({ onComplete }: SetupViewProps) {
                         : 'text-amber-700 dark:text-amber-400'
                     }`}
                   >
-                    {item.installed ? 'OK' : 'Optionnel manquant'}
+                    {item.installed ? 'OK' : item.required ? 'Requis manquant' : 'Optionnel manquant'}
                   </span>
                 </div>
               ))}
@@ -241,7 +258,7 @@ export function SetupView({ onComplete }: SetupViewProps) {
 
         {/* Footer Actions */}
         <div className="pt-4 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between">
-          {step > 1 ? (
+          {step > 1 && step < 4 ? (
             <button
               type="button"
               onClick={() => setStep((s) => (s - 1) as 1 | 2 | 3 | 4)}
@@ -254,7 +271,7 @@ export function SetupView({ onComplete }: SetupViewProps) {
             <span />
           )}
 
-          {step < 4 ? (
+          {step < 3 ? (
             <button
               type="button"
               onClick={handleNext}
@@ -263,15 +280,24 @@ export function SetupView({ onComplete }: SetupViewProps) {
               <span>Continuer</span>
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
-          ) : (
+          ) : step === 3 ? (
             <button
               type="button"
               disabled={finishing}
-              onClick={handleFinish}
+              onClick={handleClaim}
               className="inline-flex items-center gap-1.5 px-5 py-2 text-xs font-semibold rounded-md bg-blue-700 hover:bg-blue-800 text-white"
             >
               <Check className="w-3.5 h-3.5" />
-              <span>{finishing ? 'Finalisation…' : 'Nouveau scan'}</span>
+              <span>{finishing ? 'Initialisation…' : 'Initialiser l’instance'}</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleFinish}
+              className="inline-flex items-center gap-1.5 px-5 py-2 text-xs font-semibold rounded-md bg-blue-700 hover:bg-blue-800 text-white"
+            >
+              <ArrowRight className="w-3.5 h-3.5" />
+              <span>Nouveau scan</span>
             </button>
           )}
         </div>

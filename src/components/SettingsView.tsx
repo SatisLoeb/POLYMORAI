@@ -25,16 +25,36 @@ export function SettingsView({
   const [chains, setChains] = useState<ChainSetting[]>([]);
   const [doctor, setDoctor] = useState<DoctorCheck[]>([]);
   const [user, setUser] = useState('admin');
+  const [execution, setExecution] = useState<{ allowUnsandboxedExecution: boolean; sandboxAvailable: boolean } | null>(null);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
     Promise.all([api.getSettings(), api.getDoctor()]).then(([settings, doc]) => {
       setLlm(settings.llm);
       setChains(settings.chains);
       setUser(settings.user);
+      setExecution(settings.execution);
       setDoctor(doc.checks);
     });
   }, []);
+
+  const handleToggleUnsandboxed = async (allow: boolean) => {
+    if (!execution) return;
+    setSaveError(null);
+    try {
+      const res = await api.saveExecution(allow);
+      setExecution({ ...execution, allowUnsandboxedExecution: res.execution.allowUnsandboxedExecution });
+      flashSaved(allow ? 'Exécution hors sandbox autorisée.' : 'Exécution hors sandbox interdite.');
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Erreur.');
+    }
+  };
+
+  const handleLogout = async () => {
+    await api.logout().catch(() => undefined);
+    window.location.assign('/login');
+  };
 
   const flashSaved = (msg: string) => {
     setSavedNotice(msg);
@@ -44,20 +64,30 @@ export function SettingsView({
   const handleSaveLlm = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!llm) return;
-    const { llm: updated } = await api.saveLlm({
-      provider: llm.provider,
-      model: llm.model,
-      defaultTokenBudget: llm.defaultTokenBudget,
-    });
-    setLlm(updated);
-    flashSaved('Configuration LLM enregistrée.');
+    setSaveError(null);
+    try {
+      const { llm: updated } = await api.saveLlm({
+        provider: llm.provider,
+        model: llm.model,
+        defaultTokenBudget: llm.defaultTokenBudget,
+      });
+      setLlm(updated);
+      flashSaved('Configuration LLM enregistrée.');
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Erreur.');
+    }
   };
 
   const handleSaveChains = async (e: React.FormEvent) => {
     e.preventDefault();
-    const { chains: updated } = await api.saveChains(chains);
-    setChains(updated);
-    flashSaved('Paramètres RPC & seuils enregistrés.');
+    setSaveError(null);
+    try {
+      const { chains: updated } = await api.saveChains(chains);
+      setChains(updated);
+      flashSaved('Paramètres RPC & seuils enregistrés.');
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Erreur.');
+    }
   };
 
   const tabs: Array<{ key: SettingsTab; label: string }> = [
@@ -83,6 +113,11 @@ export function SettingsView({
           <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700 dark:text-emerald-400">
             <Check className="w-4 h-4" />
             {savedNotice}
+          </span>
+        )}
+        {saveError && (
+          <span role="alert" className="text-xs font-semibold text-red-700 dark:text-red-400">
+            {saveError}
           </span>
         )}
       </div>
@@ -117,7 +152,7 @@ export function SettingsView({
             Modèle de chasse (Google Gemini)
           </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            La clé API est gérée automatiquement côté serveur dans <code className="font-mono">GEMINI_API_KEY</code> via le panneau <strong>Settings &gt; Secrets</strong>.
+            La clé API est lue côté serveur dans la variable d’environnement <code className="font-mono">GEMINI_API_KEY</code> (Secrets AI Studio ou <code className="font-mono">.env</code>). Elle n’est jamais stockée ni renvoyée par l’API.
           </p>
           <div>
             <label htmlFor="llm-provider" className="block text-xs font-medium mb-1">
@@ -180,7 +215,7 @@ export function SettingsView({
                 RPC par réseau & seuil G0 (chain_settings)
               </h2>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                Utilisés automatiquement pour L3 (funds-at-risk), L4 (provenance bytecode) et <code className="font-mono">FORK_RPC_URL</code> (G11).
+                Utilisés pour L3 (soldes natifs × feed Chainlink vérifié par <code className="font-mono">description()</code>), L4 (provenance bytecode) et <code className="font-mono">FORK_RPC_URL</code> des PoC qui forkent. Le serveur vérifie <code className="font-mono">eth_chainId</code> avant toute mesure.
               </p>
             </div>
             <button
@@ -193,7 +228,7 @@ export function SettingsView({
 
           <div className="divide-y divide-slate-100 dark:divide-slate-800/80">
             {chains.map((ch, idx) => (
-              <div key={ch.chain} className="py-4 grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+              <div key={ch.chain} className="py-4 grid grid-cols-1 md:grid-cols-5 gap-4 items-end">
                 <div>
                   <div className="text-sm font-semibold text-slate-900 dark:text-white">
                     {ch.label}
@@ -239,6 +274,38 @@ export function SettingsView({
                     className="w-full h-9 px-3 text-xs font-mono tabular-nums bg-[#F8F9FB] dark:bg-[#0B0E14] border border-slate-300 dark:border-slate-700 rounded-md"
                   />
                 </div>
+                <div>
+                  <label htmlFor={`chainid-${ch.chain}`} className="block text-xs font-medium mb-1">
+                    chainId attendu
+                  </label>
+                  <input
+                    id={`chainid-${ch.chain}`}
+                    type="number"
+                    value={ch.chainId ?? ''}
+                    onChange={(e) => {
+                      const next = [...chains];
+                      next[idx] = { ...ch, chainId: e.target.value ? Number(e.target.value) : null };
+                      setChains(next);
+                    }}
+                    className="w-full h-9 px-3 text-xs font-mono tabular-nums bg-[#F8F9FB] dark:bg-[#0B0E14] border border-slate-300 dark:border-slate-700 rounded-md"
+                  />
+                </div>
+                <div>
+                  <label htmlFor={`feed-${ch.chain}`} className="block text-xs font-medium mb-1">
+                    Feed {ch.nativeUsdFeedDescription}
+                  </label>
+                  <input
+                    id={`feed-${ch.chain}`}
+                    type="text"
+                    value={ch.nativeUsdFeed}
+                    onChange={(e) => {
+                      const next = [...chains];
+                      next[idx] = { ...ch, nativeUsdFeed: e.target.value.trim() };
+                      setChains(next);
+                    }}
+                    className="w-full h-9 px-3 text-xs font-mono bg-[#F8F9FB] dark:bg-[#0B0E14] border border-slate-300 dark:border-slate-700 rounded-md"
+                  />
+                </div>
               </div>
             ))}
           </div>
@@ -252,7 +319,7 @@ export function SettingsView({
               Diagnostic Toolchain (polymorphe doctor)
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              L’ingest refuse explicitement de tourner sans <code className="font-mono">forge</code> et signale l’absence de Slither ou Aderyn.
+              Chaque ligne est le résultat d’un <code className="font-mono">--version</code> exécuté sur ce serveur ; bwrap est validé par une vraie création de namespaces.
             </p>
           </div>
           <div className="overflow-x-auto">
@@ -301,6 +368,24 @@ export function SettingsView({
               </tbody>
             </table>
           </div>
+          {execution && (
+            <div className="px-5 py-4 border-t border-slate-200 dark:border-slate-800 space-y-2 text-xs">
+              <div className="font-semibold text-slate-900 dark:text-white">
+                Sandbox d’exécution : {execution.sandboxAvailable ? 'bwrap opérationnel' : 'indisponible'}
+              </div>
+              <p className="text-slate-600 dark:text-slate-400">
+                Les builds et PoC exécutent le code du dépôt cible. Sans sandbox, ce code tourne avec les droits du serveur (accès à vos fichiers, clés, wallets).
+              </p>
+              <label className="inline-flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={execution.allowUnsandboxedExecution}
+                  onChange={(e) => handleToggleUnsandboxed(e.target.checked)}
+                />
+                <span>Autoriser l’exécution hors sandbox quand bwrap est indisponible</span>
+              </label>
+            </div>
+          )}
         </section>
       )}
 
@@ -311,8 +396,15 @@ export function SettingsView({
               Compte opérateur & préférences d’interface
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-              Utilisateur JWT actif : <span className="font-mono font-semibold text-slate-900 dark:text-white">{user}</span>
+              Session active : <span className="font-mono font-semibold text-slate-900 dark:text-white">{user}</span>
             </p>
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="mt-3 h-8 px-3 text-xs font-semibold rounded-md border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800"
+            >
+              Se déconnecter
+            </button>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">

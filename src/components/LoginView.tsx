@@ -33,7 +33,7 @@ export function LoginView({ onSuccess }: LoginViewProps) {
             Connexion Polymorphe
           </h1>
           <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-            Session opérateur locale (utilisateur par défaut : <span className="font-mono">admin</span>).
+            Session opérateur (identifiant : <span className="font-mono">admin</span>). Cinq échecs bloquent l’adresse IP 15 minutes.
           </p>
         </div>
 

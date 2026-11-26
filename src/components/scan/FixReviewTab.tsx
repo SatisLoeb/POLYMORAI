@@ -153,7 +153,7 @@ export function FixReviewTab({ findings, locale, onFindingUpdated }: FixReviewTa
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <div className="text-xs font-mono text-slate-500 dark:text-slate-400">
-                    {review.baseCommit}..{review.headCommit} · {review.prOrCommitUrl}
+                    {review.baseCommit.slice(0, 12)}..{review.headCommit.slice(0, 12)} · {review.prOrCommitUrl}
                   </div>
                   <div className="mt-1 text-sm font-semibold">
                     Verdict :{' '}
@@ -167,10 +167,12 @@ export function FixReviewTab({ findings, locale, onFindingUpdated }: FixReviewTa
                       }
                     >
                       {review.verdict === 'fixed'
-                        ? 'Corrigé (fixed)'
+                        ? 'PoC échoue sur la tête (fixed)'
                         : review.verdict === 'still_reproducible'
-                          ? 'Toujours reproductible (still_reproducible)'
-                          : 'Correction partielle (partial)'}
+                          ? 'PoC passe encore (still_reproducible)'
+                          : review.verdict === 'pending'
+                            ? 'Rejeu en cours…'
+                            : 'Non concluant (PoC non compilé / non exécuté)'}
                     </span>
                   </div>
                 </div>
@@ -193,14 +195,19 @@ export function FixReviewTab({ findings, locale, onFindingUpdated }: FixReviewTa
                 </button>
               </div>
 
-              <pre className="p-3 rounded-md bg-[#0D1117] text-slate-200 text-xs font-mono overflow-x-auto whitespace-pre-wrap">
-                {review.pocReplayOutput}
+              <pre className="p-3 rounded-md bg-[#0D1117] text-slate-200 text-xs font-mono overflow-x-auto whitespace-pre-wrap max-h-80 overflow-y-auto">
+                {review.pocReplayOutput || review.error || '(en attente)'}
               </pre>
 
               <div>
                 <h4 className="text-xs font-semibold text-slate-700 dark:text-slate-300 mb-2">
                   Analyse des sinks frères (patchlag)
                 </h4>
+                {review.siblingSinks.length === 0 && (
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Non exécutée par cette version : seul le PoC du finding est rejoué. Les frères non patchés restent à chasser à la main.
+                  </p>
+                )}
                 <ul className="divide-y divide-slate-100 dark:divide-slate-800/80 text-xs">
                   {review.siblingSinks.map((sink) => (
                     <li key={sink.fileLine} className="py-2 flex flex-col sm:flex-row sm:items-center justify-between gap-1">

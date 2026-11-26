@@ -23,6 +23,8 @@ export type ScanStepKey =
 
 export type StepStatus = 'pending' | 'running' | 'done' | 'blocked' | 'needs_input' | 'failed';
 
+export type MissingInputKind = 'program_scope' | 'rpc' | 'funds_attestation' | 'build_fix';
+
 export interface G0VerdictLine {
   id: 'L1' | 'L2' | 'L3' | 'L4' | 'L5' | 'L6';
   ruleRef: string;
@@ -30,6 +32,8 @@ export interface G0VerdictLine {
   status: G0LineStatus;
   value: string;
   detail: string;
+  /** Set when status === 'needs_input': which operator input unblocks this line. */
+  needs?: MissingInputKind;
   artifact: {
     id: string;
     source: string;
@@ -46,7 +50,7 @@ export interface G0Report {
   overrideReason?: string;
   overrideBy?: string;
   overrideAt?: string;
-  missingInputKind?: 'rpc' | 'build_fix';
+  missingInputKind?: MissingInputKind;
   missingChain?: string;
   verdictLines: G0VerdictLine[];
 }
@@ -59,12 +63,86 @@ export interface ScanStep {
   artifactSummary?: string;
 }
 
+/**
+ * Program facts copied by the operator from the program page.
+ * Nothing in here is inferred by Polymorphe: every field is an attestation with a source.
+ */
+export interface ProgramScope {
+  attestedAt: string;
+  attestedBy: string;
+  sourceUrl: string;
+  status: 'active' | 'paused' | 'closed';
+  verbatimImpacts: string[];
+  maxBountyUsd: number | null;
+  /** ISO date the program (or the in-scope asset) was listed — feeds L5 dwell. */
+  listedAt?: string;
+  knownIssues: string[];
+  scopeKind: 'deployed' | 'commit_anchored';
+  chain: string;
+  scopeAddresses: string[];
+  repoUrl?: string;
+  pinnedCommit?: string;
+}
+
+export interface FundsAttestation {
+  usd: number;
+  sourceUrl: string;
+  attestedAt: string;
+  attestedBy: string;
+}
+
+export interface AddressMeasurement {
+  address: string;
+  codeSize: number;
+  proxyKind: 'none' | 'eip1967' | 'eip1967_beacon' | 'eip1167';
+  implementation?: string;
+  implementationCodeSize?: number;
+  nativeBalanceWei: string;
+}
+
+export interface OnchainMeasurement {
+  chain: string;
+  expectedChainId: number | null;
+  chainId: number;
+  blockNumber: number;
+  measuredAt: string;
+  addresses: AddressMeasurement[];
+  nativeUsd?: {
+    feed: string;
+    description: string;
+    answer: string;
+    decimals: number;
+    updatedAt: number;
+  };
+  /** Native balances priced by the on-chain feed. A LOWER bound: ERC-20 holdings are not counted. */
+  fundsLowerBoundUsd: number | null;
+  errors: string[];
+}
+
+export interface ProvenanceResult {
+  address: string;
+  /** Address whose bytecode was compared (implementation when the scope address is a proxy). */
+  comparedAddress: string;
+  blockNumber: number;
+  status: 'matched' | 'diverged' | 'no_match' | 'no_code';
+  bestMatch?: {
+    contract: string;
+    sourcePath: string;
+    abiSelectors: number;
+    matchedSelectors: number;
+    missingSelectors: string[];
+  };
+}
+
 export interface IngestResult {
   buildOk: boolean;
   foundryFfiDisabled: boolean;
   npmScriptsIgnored: boolean;
+  sandbox: 'bwrap' | 'none';
   buildLog: string;
+  buildRunId?: string;
   contractsCount: number;
+  sourceFiles: string[];
   untestedMonetaryFunctions: Array<{
     contract: string;
     functionName: string;
@@ -79,6 +157,7 @@ export interface IngestResult {
     severity: 'high' | 'medium' | 'info';
     message: string;
   }>;
+  provenance?: ProvenanceResult[];
   provenanceMatch?: {
     chain: string;
     address: string;
@@ -86,6 +165,17 @@ export interface IngestResult {
     pinnedCommit: string;
     status: 'matched' | 'diverged' | 'n/a';
   };
+}
+
+export interface WorkspaceInfo {
+  source: 'git' | 'local';
+  repoUrl: string;
+  commit: string;
+  preparedAt: string;
+  /** Foundry project root, relative to the repo root ('' when it is the root). */
+  projectDir: string;
+  layout: { src: string; test: string; out: string };
+  sanitizedConfig: string[];
 }
 
 export interface ThreatModel {
@@ -111,9 +201,13 @@ export interface Hypothesis {
   door: 'door_a_untested' | 'invariant' | 'seam' | 'tombstone_sibling';
   title: string;
   targetFileLine: string;
+  /** false when the LLM pointed at a file/line that does not exist in the workspace. */
+  targetVerified: boolean;
   outcome: HypothesisOutcome;
+  /** Id of an executed run (ExecRun) — the only thing that can justify a kill or a candidate. */
   artifactId?: string;
   reason?: string;
+  testRunIds: string[];
   updatedAt: string;
 }
 
@@ -144,8 +238,41 @@ export interface DappSeamEvent {
   notes: string;
 }
 
+export type ExecRunKind = 'build' | 'poc_replay' | 'kill_test' | 'fix_review';
+
+/** One executed command. The only artifact type allowed to back a verdict. */
+export interface ExecRun {
+  id: string;
+  scanId: string;
+  kind: ExecRunKind;
+  /** findingId / hypothesisId / fixReviewId the run belongs to. */
+  subjectId?: string;
+  status: 'queued' | 'running' | 'finished' | 'error' | 'cancelled';
+  command: string;
+  commit: string;
+  sandbox: 'bwrap' | 'none';
+  startedAt?: string;
+  finishedAt?: string;
+  durationMs?: number;
+  /** Exit code of each repetition (clean-room replays run twice). */
+  exitCodes: number[];
+  compileFailed: boolean;
+  testsPassed: number;
+  testsFailed: number;
+  /** true only if every repetition exited 0 with at least one passing test and zero failures. */
+  passed: boolean;
+  output: string;
+  error?: string;
+}
+
 export type FindingSeverity = 'critical' | 'high' | 'medium' | 'low';
-export type FindingStatus = 'candidate' | 'operator_confirmed' | 'rejected' | 'hold';
+export type FindingStatus =
+  | 'replaying'
+  | 'replay_failed'
+  | 'candidate'
+  | 'operator_confirmed'
+  | 'rejected'
+  | 'hold';
 export type DeploymentCheckKind = 'verified_at_block' | 'commit_anchored_na';
 
 export interface OperatorSignoff {
@@ -159,8 +286,9 @@ export interface OperatorSignoff {
 }
 
 export interface DisconfirmerReview {
-  status: 'clear' | 'flagged';
-  ranAt: string;
+  status: 'clear' | 'flagged' | 'not_run';
+  ranAt: string | null;
+  model?: string;
   legitimateAlternativeTest: string;
   notes: string;
   canKillFinding: false;
@@ -171,10 +299,12 @@ export interface FixReviewRecord {
   findingId: string;
   prOrCommitUrl: string;
   ranAt: string;
+  status: 'running' | 'finished' | 'error';
   baseCommit: string;
   headCommit: string;
-  verdict: 'fixed' | 'still_reproducible' | 'partial';
-  pocReplayExitCode: number;
+  verdict: 'fixed' | 'still_reproducible' | 'inconclusive' | 'pending';
+  runId?: string;
+  pocReplayExitCode: number | null;
   pocReplayOutput: string;
   siblingSinks: Array<{
     fileLine: string;
@@ -183,6 +313,7 @@ export interface FixReviewRecord {
     note: string;
   }>;
   summaryMarkdown: string;
+  error?: string;
 }
 
 export interface Finding {
@@ -201,6 +332,7 @@ export interface Finding {
   pocSource: string;
   pocReplayCommand: string;
   pocReplayTrace: string;
+  replayRunId?: string;
   cleanRoomVerified: boolean;
   disconfirmer: DisconfirmerReview;
   recommendation: string;
@@ -233,6 +365,10 @@ export interface ScanRun {
   };
   steps: ScanStep[];
   g0: G0Report;
+  programScope?: ProgramScope;
+  fundsAttestation?: FundsAttestation;
+  onchain?: OnchainMeasurement;
+  workspace?: WorkspaceInfo;
   ingest: IngestResult;
   threatModel: ThreatModel;
   hypotheses: Hypothesis[];
@@ -243,8 +379,12 @@ export interface ScanRun {
 export interface ChainSetting {
   chain: string;
   label: string;
+  chainId: number | null;
   rpcUrl: string;
   rpcConfigured: boolean;
+  /** Chainlink <native>/USD aggregator used to price native balances. Verified via description() at read time. */
+  nativeUsdFeed: string;
+  nativeUsdFeedDescription: string;
   etherscanKeyMasked: string;
   minFundsAtRiskUsd: number;
 }
@@ -274,6 +414,13 @@ export interface AdvancedSnapshot {
   mcpTools: Array<{ name: string; gate: string; description: string }>;
   serverLogs: Array<{ ts: string; level: 'info' | 'warn'; component: string; msg: string }>;
   capturedTraffic: DappSeamEvent[];
+}
+
+export interface AuthStatus {
+  setupRequired: boolean;
+  setupTokenRequired: boolean;
+  authenticated: boolean;
+  user: string | null;
 }
 
 export type ExportFormat = 'immunefi' | 'cantina' | 'sherlock';

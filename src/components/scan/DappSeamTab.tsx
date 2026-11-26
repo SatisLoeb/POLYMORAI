@@ -12,7 +12,7 @@ export function DappSeamTab({ scan }: DappSeamTabProps) {
           Capture dApp & coutures web2 ↔ web3
         </h2>
         <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-          Rejeu Anvil dans un répertoire temporaire vide et isolé (G12) à partir des signatures et appels interceptés par l’extension navigateur.
+          Non implémenté dans cette version : aucune capture dApp n’est effectuée ni simulée.
         </p>
       </div>
 
@@ -20,7 +20,7 @@ export function DappSeamTab({ scan }: DappSeamTabProps) {
         <div className="p-8 text-center text-sm text-slate-500 dark:text-slate-400 space-y-2">
           <p>Aucune capture dApp enregistrée pour ce scan.</p>
           <p className="text-xs">
-            Activez l’extension navigateur Polymorphe sur l’application frontale de la cible pour capturer les signatures EIP-712 et transactions relayer.
+            Pour une couture web2 ↔ web3, créez une hypothèse « seam » dans l’onglet Chasse et prouvez-la par un PoC Foundry.
           </p>
         </div>
       ) : (
